@@ -14,12 +14,21 @@ _JUDGE_CUE = re.compile(
     r")\b"
 )
 
+# Leading honorific glued inside a SpaCy PERSON span ("Honorable Ronald A. Guzman")
+_LEADING_HONORIFIC = re.compile(r"(?i)^(the\s+)?hon(?:orable)?\.?\s+")
+
 # Direct "Judge First Last" patterns (high precision supplement).
 # Middle initial MUST include a period (A-Z\.) so "Consent Form" / "Assignment To"
 # cannot truncate to "Consent F" / "Assignment T". Surnames must be 2+ letters.
 _JUDGE_NAME_RE = re.compile(
     r"(?i)\b(?:hon(?:orable)?\.?\s+)?(?:(?:chief|senior|magistrate|district|bankruptcy)\s+)?"
     r"(?:judge|magistrate)\s+"
+    r"([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]{1,}){0,3})"
+)
+
+# "before the Honorable First Last" — no "Judge" token between honorific and name.
+_HONORABLE_NAME_RE = re.compile(
+    r"(?i)\b(?:the\s+)?hon(?:orable)?\.?\s+"
     r"([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]{1,}){0,3})"
 )
 
@@ -46,7 +55,8 @@ def _load_nlp(model: str):
 _TRAILING_JUNK = re.compile(
     r"(?i)\s+\b("
     r"on|signed|for|held|as|to|from|by|dated|entered|cc|"
-    r"and|or|is|are|was|were|has|have|will|shall|no|not|the|a|an|"
+    # Do NOT include a|an|the here — IGNORECASE would eat middle initials (A. / An.).
+    r"and|or|is|are|was|were|has|have|will|shall|no|not|"
     r"in|at|of|with|who|that|this|defendant|plaintiff|counsel|"
     r"filed|filing|order|orders|hearing|conference|chambers|courtroom|"
     r"jury|room|longer|available|dismissed|vacated|withdrawn|present|"
@@ -159,16 +169,28 @@ def extract_judges_from_docket_text(
 
     found: dict[tuple[int, int], dict] = {}
 
-    # Regex high-precision hits
-    for m in _JUDGE_NAME_RE.finditer(text):
-        raw = _clean_name(m.group(1))
-        if raw and _looks_like_person_name(raw) and len(raw.split()) >= 2:
-            found[(m.start(1), m.start(1) + len(raw))] = {
-                "raw": raw,
-                "start": m.start(1),
-                "end": m.start(1) + len(raw),
-                "method": "regex_judge_title",
+    def _add(raw: str, start: int, method: str) -> None:
+        cleaned = _clean_name(raw)
+        if not cleaned or not _looks_like_person_name(cleaned) or len(cleaned.split()) < 2:
+            return
+        key = (start, start + len(cleaned))
+        prev = found.get(key)
+        if prev is None or len(cleaned) > len(prev["raw"]):
+            found[key] = {
+                "raw": cleaned,
+                "start": start,
+                "end": start + len(cleaned),
+                "method": method,
             }
+
+    # Regex high-precision hits: "Judge First Last"
+    for m in _JUDGE_NAME_RE.finditer(text):
+        _add(m.group(1), m.start(1), "regex_judge_title")
+
+    # "Honorable First Last" without an intervening Judge token
+    for m in _HONORABLE_NAME_RE.finditer(text):
+        # Skip if this span is already covered by the Judge-title regex
+        _add(m.group(1), m.start(1), "regex_honorable")
 
     # SpaCy NER
     try:
@@ -182,19 +204,15 @@ def extract_judges_from_docket_text(
             continue
         left = max(0, ent.start_char - 30)
         cue_window = text[left : ent.start_char]
+        ent_text = ent.text or ""
+        # PERSON often includes the honorific; treat leading Hon./Honorable as the cue.
+        if _LEADING_HONORIFIC.match(ent_text):
+            name_only = _LEADING_HONORIFIC.sub("", ent_text).strip()
+            _add(name_only, ent.start_char + (len(ent_text) - len(name_only)), f"spacy_{ent.label_}_honorific")
+            continue
         if not _JUDGE_CUE.search(cue_window):
             continue
-        raw = _clean_name(ent.text)
-        if not raw or not _looks_like_person_name(raw):
-            continue
-        key = (ent.start_char, ent.start_char + len(raw))
-        if key not in found:
-            found[key] = {
-                "raw": raw,
-                "start": ent.start_char,
-                "end": ent.start_char + len(raw),
-                "method": f"spacy_{ent.label_}",
-            }
+        _add(ent_text, ent.start_char, f"spacy_{ent.label_}")
 
     by_norm: dict[str, dict] = {}
     for item in sorted(found.values(), key=lambda x: x["start"]):

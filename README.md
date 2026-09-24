@@ -62,7 +62,12 @@ Optional flags:
 - `--limit 50` — process only the first N files (after sort)
 - `--files a.json b.json` — explicit file list
 - `--poc-bard5` — original 5-file Bard subset only
+- `--resume-from data/runs/prior` — REUSE SJ/SF/SPIDs from a prior run
+- `--cold-start` — remint IDs from zero (default: auto-resume if `entities.jsonl` already exists in `--output-dir`)
 - `--debug-steps` — also write per-file `step_XX_*` snapshots (off by default)
+
+**IDs / USA:** Party abbreviations expand via `configs/parties.yaml` `expand_abbreviations` (not code hardcoding). Re-running into the same `--output-dir` reuses entity IDs when stable keys match.
+
 
 ---
 

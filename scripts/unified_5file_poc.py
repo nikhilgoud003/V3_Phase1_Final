@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""Unified one-pass ER — 5-file cold-start proof of concept.
+"""Unified one-pass ER — PACER JSON cold/warm resolve (judges + firms + parties).
 
 Orchestration only. Does NOT modify:
-  - configs/{judges,firms,parties}.yaml matching rules
   - engine/tiers.py Tier0–3 logic
   - engine/tier3_citation.py
-  - live Tentris or pilot registries
+  - live Tentris
 
 Process (per file, in order):
   1. Read the PACER JSON once.
-  2. Extract via existing YAML sources (known fields) + judges spaCy NER on docket.
-  3. Walk remaining string leaves; for never-seen path patterns, one cached qwen
-     call classifies field type (judge/firm/party/other); typed names become
-     candidate mentions and still pass the type's finalize gates.
-  4. Resolve cumulatively (mentions from files 1..k) with run_cascade + cluster.
-  5. Write one final folder: entities.jsonl, mentions.jsonl, decisions.jsonl,
-     summary.json. Per-file step_XX_* snapshots only with --debug-steps.
+  2. Extract via existing YAML sources + judges spaCy NER on docket.
+  3. Walk unknown string leaves (cached qwen field typing).
+  4. Resolve cumulatively with run_cascade + cluster.
+  5. Write entities.jsonl, mentions.jsonl, decisions.jsonl, summary.json.
 
-Cold start: no live pilot registries loaded.
+By default, if --output-dir already has entities.jsonl, SJIDs are REUSED
+(--resume-from / auto-resume). Pass --cold-start to remint from zero.
 """
 
 from __future__ import annotations
@@ -435,6 +432,99 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def _alias_name_to_group(cfgs: dict[str, dict]) -> dict[str, str]:
+    """Map normalized alias strings → group id from YAML alias_groups (config data)."""
+    out: dict[str, str] = {}
+    for cfg in cfgs.values():
+        for grp in (cfg.get("tier0") or {}).get("alias_groups") or []:
+            gid = str(grp.get("id") or "alias")
+            for name in grp.get("names") or []:
+                nn = " ".join(str(name).lower().split())
+                if nn:
+                    out[nn] = gid
+    return out
+
+
+def poc_stable_key(e: dict, alias_to_gid: dict[str, str]) -> str:
+    """Stable identity key across runs (no remint when the same entity reappears)."""
+    from engine.rdf_emit import entity_signature
+
+    et = (e.get("entity_type") or e.get("type") or "").strip()
+    nn = " ".join((e.get("normalized_name") or "").lower().split())
+    if et == "judge":
+        nids = [str(x) for x in (e.get("fjc_nids") or []) if x]
+        if nids:
+            return f"judge:nid:{sorted(nids)[0]}"
+        courts = "|".join(sorted(e.get("courts") or []))
+        return f"judge:name:{nn}|{courts}"
+    if et == "firm":
+        return f"firm:{entity_signature({**e, 'entity_type': 'firm'})}"
+    # party — alias-group members share one key (config-driven); others keyed by name+court
+    gid = alias_to_gid.get(nn)
+    if gid:
+        return f"party:alias:{gid}"
+    courts = "|".join(sorted(e.get("courts") or []))
+    return f"party:name:{nn}|{courts}"
+
+
+def load_prior_entities(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    return [json.loads(l) for l in path.open(encoding="utf-8") if l.strip()]
+
+
+def remap_entity_ids(
+    entities_by_type: dict[str, list[dict]],
+    prior: list[dict],
+    alias_to_gid: dict[str, str],
+    prefixes: dict[str, str],
+) -> tuple[dict[str, list[dict]], dict[str, Any]]:
+    """REUSE prior sjids by stable key; CREATE only for new keys (serial after max)."""
+    by_key: dict[str, dict] = {}
+    max_serial: dict[str, int] = {t: -1 for t in prefixes}
+    for e in prior:
+        et = (e.get("entity_type") or e.get("type") or "").strip()
+        if et not in prefixes:
+            continue
+        key = poc_stable_key(e, alias_to_gid)
+        by_key[key] = e
+        sid = str(e.get("sjid") or "")
+        pref = prefixes[et]
+        if sid.startswith(pref) and sid[len(pref) :].isdigit():
+            max_serial[et] = max(max_serial[et], int(sid[len(pref) :]))
+
+    report = {"n_reuse": 0, "n_create": 0, "by_type": {}}
+    out: dict[str, list[dict]] = {}
+    for etype, ents in entities_by_type.items():
+        pref = prefixes[etype]
+        remapped: list[dict] = []
+        t_reuse = t_create = 0
+        for e in ents:
+            row = dict(e)
+            row["type"] = etype
+            row["entity_type"] = etype
+            key = poc_stable_key(row, alias_to_gid)
+            hit = by_key.get(key)
+            if hit and hit.get("sjid"):
+                row["sjid"] = hit["sjid"]
+                # Keep prior entity_id when reusing so downstream refs stay stable
+                if hit.get("entity_id"):
+                    row["entity_id"] = hit["entity_id"]
+                t_reuse += 1
+            else:
+                max_serial[etype] += 1
+                row["sjid"] = f"{pref}{max_serial[etype]:06d}"
+                row["entity_id"] = f"ent_{etype[0]}_{max_serial[etype]:06d}"
+                t_create += 1
+                by_key[key] = row
+            remapped.append(row)
+        out[etype] = remapped
+        report["by_type"][etype] = {"reuse": t_reuse, "create": t_create}
+        report["n_reuse"] += t_reuse
+        report["n_create"] += t_create
+    return out, report
+
+
 def entity_cross_file_report(entities: list[dict], by_id: dict[str, dict]) -> list[dict]:
     rows = []
     for e in entities:
@@ -607,6 +697,17 @@ def main() -> int:
         "--debug-steps",
         action="store_true",
         help="Also write per-file step_XX_* snapshot folders (off by default)",
+    )
+    ap.add_argument(
+        "--resume-from",
+        default=None,
+        help="Prior run dir (or entities.jsonl) whose SJIDs to REUSE. "
+        "Default: auto-resume from --output-dir/entities.jsonl when present.",
+    )
+    ap.add_argument(
+        "--cold-start",
+        action="store_true",
+        help="Ignore prior entities; remint SJIDs from zero (default is resume when possible)",
     )
     args = ap.parse_args()
 
@@ -873,6 +974,48 @@ def main() -> int:
                         shutil.copytree(src, dst)
 
         # --- Final single-folder outputs ---
+        # Stable SJIDs: resume from prior entities unless --cold-start
+        alias_to_gid = _alias_name_to_group(cfgs)
+        prefixes = {
+            "judge": (cfgs["judge"].get("clustering") or {}).get("id_prefix", "SJ"),
+            "firm": (cfgs["firm"].get("clustering") or {}).get("id_prefix", "SF"),
+            "party": (cfgs["party"].get("clustering") or {}).get("id_prefix", "SP"),
+        }
+        prior_path: Path | None = None
+        if not args.cold_start:
+            if args.resume_from:
+                rp = Path(args.resume_from)
+                if not rp.is_absolute():
+                    rp = ROOT / rp
+                prior_path = rp if rp.is_file() else rp / "entities.jsonl"
+            else:
+                cand = out_root / "entities.jsonl"
+                if cand.is_file():
+                    prior_path = cand
+        prior_ents = load_prior_entities(prior_path) if prior_path else []
+        id_report: dict[str, Any] = {"cold_start": True, "prior_path": None}
+        if prior_ents:
+            final_entities, id_report = remap_entity_ids(
+                final_entities, prior_ents, alias_to_gid, prefixes
+            )
+            id_report["cold_start"] = False
+            id_report["prior_path"] = str(prior_path)
+            print(
+                f"ID remap: reuse={id_report['n_reuse']} create={id_report['n_create']} "
+                f"from {prior_path}",
+                flush=True,
+            )
+        else:
+            # Still normalize prefixes/type fields for a deterministic first run
+            final_entities, id_report = remap_entity_ids(
+                final_entities, [], alias_to_gid, prefixes
+            )
+            id_report["cold_start"] = True
+            print(
+                f"ID assign (cold): create={id_report['n_create']}",
+                flush=True,
+            )
+
         decisions = _collect_decision_rows(work_dir, final_by_id)
         cross_final = {
             etype: entity_cross_file_report(final_entities[etype], {m["mention_id"]: m for m in final_mentions[etype]})
@@ -880,7 +1023,8 @@ def main() -> int:
         }
         summary = {
             "output_dir": str(out_root),
-            "cold_start": True,
+            "cold_start": bool(id_report.get("cold_start", True)),
+            "id_remap": id_report,
             "debug_steps": bool(args.debug_steps),
             "elapsed_sec": round(time.time() - t_start, 2),
             "files": [

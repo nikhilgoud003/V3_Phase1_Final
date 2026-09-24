@@ -13,6 +13,7 @@ from .config_loader import load_config, resolve_path
 from .docket_ner import extract_judges_from_docket_text
 from .name_validity import gate_mention, load_fjc_name_sets, write_quarantine
 from .normalize import (
+    apply_replace_regex,
     normalize_name,
     parse_office_address_geo,
     presentable_name,
@@ -254,6 +255,9 @@ def _emit_mention(
         strip_procedural_prefixes=bool(norm_cfg.get("strip_procedural_prefixes")),
         procedural_prefix_patterns=norm_cfg.get("procedural_prefix_patterns"),
     )
+    # Config-driven full-string expansions (e.g. parties.yaml expand_abbreviations).
+    # Applied after normalize so both punctuated and stripped forms can match.
+    normalized = apply_replace_regex(normalized, norm_cfg.get("expand_abbreviations") or [])
     if not normalized or len(normalized) <= 1:
         return None
 

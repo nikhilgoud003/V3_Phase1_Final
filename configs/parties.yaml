@@ -117,7 +117,7 @@ office_classification:
     - id: government
       subclass_from: capture_group_1
       patterns:
-        - '(?i)^(united states of america|united states)$'
+        - '(?i)^(united states of america|united states|usa|u\.?\s*s\.?\s*a\.?|u\s+s\s+a|u\s+s|us)$'
         - '(?i)^state of\s+([a-z][a-z\s]+)$'
         - '(?i)\bex rel\b'
         - '(?i)\b(department|dept)\s+of\s+'
@@ -178,14 +178,21 @@ normalization:
     - "l.l.c."
     - "gmbh"
   # Conservative expansions for common PACER party strings (config data only).
+  # Applied after normalize so both punctuated and stripped forms can match.
   expand_abbreviations:
-    - pattern: '(?i)^u\.?s\.?a\.?$'
+    - pattern: '(?i)^u\.?\s*s\.?\s*a\.?$'
       replacement: "united states of america"
-    - pattern: '(?i)^u\.?s\.?$'
+    - pattern: '(?i)^u\.?\s*s\.?$'
       replacement: "united states of america"
     - pattern: '(?i)^united states$'
       replacement: "united states of america"
     - pattern: '(?i)^usa$'
+      replacement: "united states of america"
+    - pattern: '(?i)^u\s+s\s+a$'
+      replacement: "united states of america"
+    - pattern: '(?i)^u\s+s$'
+      replacement: "united states of america"
+    - pattern: '(?i)^us$'
       replacement: "united states of america"
   # Corporate core key for Tier0/Tier1 (engine/normalize.corp_core_name).
   corp_core_key:
@@ -391,9 +398,9 @@ identity_exclusions:
 # -----------------------------------------------------------------------------
 tier0:
   enabled: true
-  # Government name aliases (USA / U.S. / United States / …). Merged only
-  # within the same UCID at Tier0 — never a global USA entity. Cross-UCID
-  # pairs in this group are excluded from Tier3 (see tier3.routing).
+  # Government name aliases (USA / U.S. / United States / …).
+  # Config names only — after expand_abbreviations they share one normalized form;
+  # merge_scope global keeps one litigant entity across cases (stable SPID).
   alias_groups:
     - id: united_states_government
       names:
@@ -403,9 +410,9 @@ tier0:
         - us
         - united states
         - united states of america
-      merge_scope: same_ucid
+      merge_scope: global
       confidence: 100
-      method: tier0.gov_usa_alias_ucid
+      method: tier0.gov_usa_alias
   rules:
     - id: exact_normalized_name_same_ucid
       description: "Identical normalized name within the same case → same party mention cluster"
@@ -552,9 +559,9 @@ tier3:
       low: 0.72
       high: 0.92
     skip_if_barrier_and_no_supporting_evidence: true
-    # Cross-UCID Tier0 alias_group pairs skip LLM (USA / United States / …).
-    skip_alias_groups_cross_ucid:
-      - united_states_government
+    # Alias-group pairs are already merged at Tier0 when merge_scope is global.
+    # Keep this empty so we do not force-NO_MATCH residual cross-UCID alias pairs.
+    skip_alias_groups_cross_ucid: []
   budget:
     target_mention_fraction_min: 0.05
     target_mention_fraction_max: 0.15
