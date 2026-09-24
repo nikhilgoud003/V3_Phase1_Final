@@ -1,0 +1,3 @@
+# Placeholder — drop common US surnames here (one per line, lowercase).
+# Used by information_content_barrier.very_common_surname.
+# Leave empty until a vetted list is provided; other barrier rules still apply.

@@ -1,0 +1,605 @@
+# =============================================================================
+# Tier_V3 entity-type config — JUDGES
+# =============================================================================
+# Purpose: Drive extract → Tier0..Tier3 → cluster → RDF for judge mentions
+# without type-specific Python branches beyond reading this schema.
+#
+# Field paths below are verified against local PACER JSON samples under
+# data/json/pilot_1000 (or $TIER_V3_JSON_DIR) and against
+# V2 JED / PHASE0_FIELD_PATHS.md (v3_tentris_judge_er).
+# Paths are repo-relative; override roots via TIER_V3_DATA_DIR / TIER_V3_OUTPUT_DIR.
+# =============================================================================
+
+entity_type: judge
+version: "0.1.0"
+description: >
+  Federal PACER judge mentions (assigned, referred, and optionally
+  docket-entry mentions). CR cases store judges on parties; CV cases store
+  judges on case header fields.
+
+# -----------------------------------------------------------------------------
+# I/O
+# -----------------------------------------------------------------------------
+io:
+  json_glob: "data/json/pilot_1000/*.json"
+  mentions_out: "data/mentions/judges_mentions.jsonl"
+  decisions_out: "data/decisions/decisions.jsonl"
+  clusters_out: "data/clusters/judges_entities.jsonl"
+  embeddings_dir: "data/embeddings/judges"
+  rdf_out: "data/rdf/judges.ttl"
+  reports_dir: "data/reports"
+
+# -----------------------------------------------------------------------------
+# Extraction (config-driven paths into PACER case JSON)
+# -----------------------------------------------------------------------------
+extraction:
+  case_meta:
+    ucid: "ucid"
+    court: "court"
+    case_id: "case_id"
+    case_type: "case_type"          # cr | cv
+    case_name: "case_name"
+    filing_date: "filing_date"
+    terminating_date: "terminating_date"
+    year_from: "filing_date"        # parse YYYY from filing_date when year absent
+
+  # Each source emits one or more mention records.
+  # CR vs CV placement differs (verified on 173 cr / 827 cv local files):
+  #   - cr: header judge almost always null; party-level judge filled on defendants
+  #   - cv: header judge filled; party-level judge never filled
+  sources:
+    - id: header_assigned
+      path: "judge"
+      kind: string_or_null
+      role: assigned
+      docket_source: case_header
+      extraction_method: header_assigned_judge
+
+    - id: header_referred
+      path: "referred_judges"
+      kind: list_of_strings
+      role: referred
+      docket_source: case_header
+      extraction_method: header_referred_judges
+
+    - id: party_assigned
+      path: "parties[].judge"
+      kind: string_or_null
+      role: assigned
+      docket_source: case_parties
+      extraction_method: party_assigned_judge
+      carry_fields:
+        party_enum: "$party_index"
+        party_name: "parties[].name"
+        party_role: "parties[].role"
+        pacer_id: "parties[].pacer_id"
+
+    - id: party_referred
+      path: "parties[].referred_judges"
+      kind: list_of_strings
+      role: referred
+      docket_source: case_parties
+      extraction_method: party_referred_judges
+      carry_fields:
+        party_enum: "$party_index"
+        party_name: "parties[].name"
+        party_role: "parties[].role"
+        pacer_id: "parties[].pacer_id"
+
+    # Docket-entry SpaCy NER (majority of V2 SEL rows are line_entry)
+    - id: docket_entry_ner
+      path: "docket[].docket_text"
+      kind: ner_span
+      enabled: true
+      role: mentioned
+      docket_source: line_entry
+      extraction_method: SPACY_EN_CORE_WEB_SM
+      ner:
+        backend: spacy
+        model: en_core_web_sm
+        label_allowlist: ["PERSON"]
+
+  # Negative evidence pools (V2 JED: drop party/counsel false positives)
+  negative_evidence:
+    party_names_path: "parties[].name"
+    counsel_names_path: "parties[].counsel[].name"
+    match_mode: exact_normalized      # normalized string equality
+    apply_counsel_names: true         # drop spans that equal a counsel person
+    # Court staff on docket lines — same drop as party/counsel, config-driven.
+    court_personnel:
+      enabled: true
+      path: "docket[].docket_text"
+      # Only docket-line spans. Never header / party-assigned judges
+      # (clerk "(Last, First) (Entered:)" often matches the assigned judge).
+      apply_to:
+        docket_sources: [line_entry]
+      patterns:
+        - name: uspo
+          regex: "\\b(?i:USPO|U\\.?S\\.?\\s*P(?:robation)?\\s*O(?:fficer)?)\\s+([A-Z][A-Za-z'.\\-]+(?:\\s+[A-Z][A-Za-z'.\\-]+){0,3})"
+        - name: court_reporter
+          regex: "\\b(?i:Court\\s+Reporters?)\\s*:?\\s*([A-Z][A-Za-z'.\\-]+(?:\\s+[A-Z][A-Za-z'.\\-]+){0,3})"
+        - name: clerk_signature
+          # PACER docketing-clerk / filer "(Last, First)" near "(Entered: …)"
+          regex: "\\(([A-Z][A-Za-z'\\-]+),\\s*([A-Z][A-Za-z'\\-]+)\\)(?=[^\\n]{0,80}\\(Entered:)"
+          last_first: true
+
+  office_name_default: null           # mention.office_name ← normalized_name
+
+  # Transfer clues mined from docket text → hard negative (X ≠ Y)
+  transfer_clues:
+    enabled: true
+    path: "docket[].docket_text"
+    patterns:
+      - name: transferred_to
+        regex: "(?i)\\btransferr(?:ed|ing)\\s+(?:this\\s+)?(?:case\\s+)?(?:to|from)\\s+(?:the\\s+)?(?:hon(?:orable)?\\.?\\s+)?(?:judge\\s+)?([A-Z][A-Za-z\\.\\'\\-]+(?:\\s+[A-Z][A-Za-z\\.\\'\\-]+){0,4})"
+      - name: reassigned_to
+        regex: "(?i)\\breassign(?:ed|ing)\\s+(?:to|from)\\s+(?:the\\s+)?(?:hon(?:orable)?\\.?\\s+)?(?:judge\\s+)?([A-Z][A-Za-z\\.\\'\\-]+(?:\\s+[A-Z][A-Za-z\\.\\'\\-]+){0,4})"
+
+  # Strings that are not real judges (from V2 header extract droppers)
+  drop_literals:
+    - "unassigned"
+    - "magistrate judge unassigned magistrate"
+    - "judge unassigned"
+    - "executive committee"
+    - "ebc"
+    - "cvb judge"
+
+# -----------------------------------------------------------------------------
+# Normalization
+# -----------------------------------------------------------------------------
+normalization:
+  lowercase: true
+  strip_honorifics:
+    - "honorable"
+    - "hon."
+    - "hon"
+    - "judge"
+    - "magistrate judge"
+    - "magistrate"
+    - "mag."
+    - "mag"
+    - "chief judge"
+    - "senior judge"
+    - "sr."
+    - "sr"
+    - "district judge"
+    - "u.s. district judge"
+    - "us district judge"
+    - "bankruptcy judge"
+    - "justice"
+    - "mj"
+  # Leading jurisdiction tags on PACER header strings (not part of the person name)
+  strip_name_prefixes:
+    - "u.s."
+    - "u.s"
+    - "us"
+  # Keep apostrophe so O'Connell / O'Neill stay one surname token (not "o connell")
+  strip_chars: ".,;:\"()[]{}"
+  collapse_whitespace: true
+  presentable_case: title             # for display name only
+  # Generational suffixes stay on the identity string (Jr/II/III) — do not strip.
+
+# -----------------------------------------------------------------------------
+# Mention hygiene (quarantine honorific/fragment; same-UCID for low-info)
+# -----------------------------------------------------------------------------
+mention_hygiene:
+  enabled: true
+  # A4: single common first names (mary/william/mark/…) may ONLY merge within UCID
+  low_info_within_ucid_only: true
+
+# -----------------------------------------------------------------------------
+# Name-compatibility gate (cascade; method=name_gate) — A1
+# -----------------------------------------------------------------------------
+name_compat:
+  enabled: true
+  max_surname_edit_distance: 1
+
+# -----------------------------------------------------------------------------
+# Name validity gate (extraction-time; quarantine with reasons — never silent drop)
+# A2/A3: dictionary-word rule + leading-initial allow when followed by surname
+# -----------------------------------------------------------------------------
+name_validity:
+  enabled: true
+  min_name_tokens: 2
+  reject_single_char_second_token: true
+  quarantine_out: "data/mentions/quarantine_name_validity.jsonl"
+  # Extra stopwords beyond engine.name_validity.DEFAULT_PROCEDURAL_STOPWORDS
+  procedural_stopwords: []
+  # research_dev extract_header_judges droppers (engine defaults cover these; extend here if needed)
+  header_drop_phrases: []
+  legal_document_terms: []
+  # Optional override; default /usr/share/dict/words
+  english_wordlist_path: null
+  whitelist:
+    use_fjc_surnames: true
+    use_fjc_full_names: true
+  # LLM micro-pass for unique strings not FJC-linked and not already a known clean name
+  llm_validation:
+    enabled: true
+    model: null          # inherit tier3 / TIER_V3_LLM_MODEL
+    prompt_path: "prompts/llm_name_validity.txt"
+    cache_path: "data/decisions/llm_name_validity_cache.jsonl"
+    journal_path: "data/decisions/llm_name_validity_journal.jsonl"
+    max_calls: 400
+
+# -----------------------------------------------------------------------------
+# Mention profile serialization (Tier 2 embedding input — NOT bare names)
+# -----------------------------------------------------------------------------
+profile_template: >
+  Judge: {normalized_name}
+  | Presentable: {presentable_name}
+  | Role: {role}
+  | Court: {court}
+  | CaseType: {case_type}
+  | UCID: {ucid}
+  | Year: {year}
+  | Source: {extraction_method}
+  | Prefix: {prefix_category}
+  | PartyContext: {party_name}
+  | CoMentionsSameCase: {co_mentions}
+
+# -----------------------------------------------------------------------------
+# Tier 0 — Deterministic strong keys (early exit, precision ~1.0)
+# -----------------------------------------------------------------------------
+# Engine evaluates rules in order; first hit merges and exits cascade.
+# Keys that do not apply to judges (e.g. email) are present for schema
+# generality but typically unused for this entity type.
+tier0:
+  enabled: true
+  rules:
+    - id: fjc_nid_join
+      description: "Same FJC NID → same judge entity"
+      type: external_id_join
+      external:
+        name: fjc
+        path: "data/judges_fjc.csv"
+        crosswalk_path: "data/external/fjc_court_crosswalk.json"
+        id_field: "nid"
+        name_fields: ["First Name", "Middle Name", "Last Name"]
+        court_fields: ["Court Name (1)", "Court Name (2)", "Court Name (3)", "Court Name (4)", "Court Name (5)", "Court Name (6)"]
+        date_fields:
+          commission: "Commission Date (1)"
+          termination: "Termination Date (1)"
+      match:
+        require:
+          - mention_linked_nid_equal
+      confidence: 100
+      method: tier0.fjc_nid_join
+
+    - id: exact_normalized_name_same_ucid
+      description: "Identical normalized name within the same case → merge"
+      type: conjunction
+      fields:
+        - normalized_name
+        - ucid
+      suffix_equiv_generational: true
+      confidence: 100
+      method: tier0.exact_name_ucid
+
+    # Identical full name + same court across years (no year gate).
+    # Contradicting evidence already blocks: distinct FJC NIDs, transfer clues.
+    - id: exact_normalized_name_same_court
+      description: >
+        Identical normalized name + same court, ≥2 tokens, no contradicting
+        evidence → merge (closes 14b UNCERTAIN on james b zagel↔james b zagel).
+      type: conjunction
+      fields:
+        - normalized_name
+        - court
+      min_name_tokens: 2
+      suffix_equiv_generational: true
+      confidence: 99
+      method: tier0.exact_name_court
+
+    - id: exact_normalized_name_same_court_year
+      description: "Identical normalized name + court + year → merge"
+      type: conjunction
+      fields:
+        - normalized_name
+        - court
+        - year
+      min_name_tokens: 2                  # do not fire on single-token names
+      suffix_equiv_generational: true
+      confidence: 99
+      method: tier0.exact_name_court_year
+
+    - id: exact_name_email
+      description: "Same name + same email (generic rule; rare for judges)"
+      type: conjunction
+      fields:
+        - normalized_name
+        - email
+      require_non_null: ["email"]
+      suffix_equiv_generational: true
+      confidence: 100
+      method: tier0.exact_name_email
+
+    - id: exact_name_office_court
+      description: "Same name + same office/firm + same court (generic; rare for judges)"
+      type: conjunction
+      fields:
+        - normalized_name
+        - office_name
+        - court
+      require_non_null: ["office_name"]
+      min_name_tokens: 2                  # do not fire on single-token names (A4)
+      suffix_equiv_generational: true
+      confidence: 99
+      method: tier0.exact_name_office_court
+
+  # FJC temporal fields are STRONG EVIDENCE, not hard kill-rules
+  # (senior / designation sitting can appear after nominal retirement)
+  fjc_date_policy:
+    mode: soft_evidence
+    weight_in_band_score: 0.15
+    allow_post_termination_mentions: true
+    note: >
+      Do not auto-reject matches solely because mention date is after
+      FJC termination_date.
+
+# -----------------------------------------------------------------------------
+# Tier 1 — Blocking (grouping only; no merge decisions)
+# -----------------------------------------------------------------------------
+tier1:
+  enabled: true
+  # Extra last-2 surname block keys (Hanovice Palermo / Garcia Marmolejo / Gonzales Ramos).
+  # Blocking only — merge still requires Tier2/name_compat.
+  compound_surnames:
+    - garcia marmolejo
+    - gonzales ramos
+    - hanovice palermo
+    - dos santos
+    - aenlle rocha
+  strategies:
+    - id: court_surname
+      key_template: "{court}|{surname}"
+      fields:
+        court: court
+        surname: surname_from_normalized_name
+
+    - id: court_initials
+      key_template: "{court}|{initials}"
+      fields:
+        court: court
+        initials: first_last_initials     # e.g. "j|s" for john smith
+
+    - id: court_surname_year
+      key_template: "{court}|{surname}|{year}"
+      optional: true
+      fields:
+        court: court
+        surname: surname_from_normalized_name
+        year: year
+
+  # Mentions with empty blocking keys still enter a residual bucket
+  residual_bucket: "_UNBLOCKED_"
+
+# -----------------------------------------------------------------------------
+# Tier 2 — Embedding similarity (recall net inside blocks)
+# -----------------------------------------------------------------------------
+tier2:
+  enabled: true
+  backend: ollama_faiss
+  ollama_embed_model: "nomic-embed-text"
+  model: "nomic-embed-text"              # Ollama embed model (replaces rapidfuzz)
+  fallback_model: "rapidfuzz"            # used only if Ollama/FAISS fails
+  index:
+    backend: faiss
+    metric: ip
+    path: "data/embeddings/judges/faiss.index"
+    id_map_path: "data/embeddings/judges/id_map.jsonl"
+
+  search:
+    top_k: 25
+    min_similarity: 0.72                  # tune on pilot; not assumed final
+    auto_merge_min: 0.92                  # only if information-content OK
+    ambiguous_low: 0.72
+    ambiguous_high: 0.92
+
+  # Marginal recall test (required deliverable metric)
+  marginal_recall:
+    enabled: true
+    definition: >
+      Fraction of gold-positive pairs found by Tier2 candidates that were
+      NOT already merged by Tier0. Reported in data/reports/tier2_marginal_recall.json
+
+# -----------------------------------------------------------------------------
+# Information-content barrier (blocks auto-merge; does NOT auto-send to LLM)
+# -----------------------------------------------------------------------------
+information_content_barrier:
+  enabled: true
+  triggers:
+    - id: single_token_name
+      rule: "token_count(normalized_name) == 1"
+
+    - id: initial_heavy
+      rule: "initial_token_ratio >= 0.5"
+      # e.g. "J. H. Donald" → tokens J, H, Donald → 2/3 initials
+
+    - id: very_common_surname
+      rule: "surname in common_surnames_list"
+      list_path: "data/external/common_surnames.txt"
+      # File may be empty initially; barrier still applies for single/initial rules
+
+  on_trigger:
+    allow_tier0: true                     # exact strong keys still OK
+    allow_tier2_auto_merge: false         # barrier blocks Tier2 auto-merge only
+    allow_tier2_candidate: true
+    auto_send_to_llm: false               # only ambiguous-band + same-block reach LLM
+    # Tier3: LLM may overrule barrier when MATCH and confidence >=
+    # tier3.barrier_llm_min_confidence (default 80). Shared FJC NID always allows MATCH.
+
+# -----------------------------------------------------------------------------
+# Tier 3 — LLM adjudication (ambiguous band only; target 5–15% of mentions)
+# -----------------------------------------------------------------------------
+tier3:
+  enabled: true
+  backend: ollama                         # ollama (dev) | vllm (prod)
+  model: "qwen2.5:7b"                     # override with $TIER_V3_LLM_MODEL (Colab: qwen2.5:14b)
+  alternate_models:
+    - "llama3.2:latest"
+    - "gemma4:latest"
+  endpoint: "http://localhost:11434"      # override with $OLLAMA_HOST
+  progress_log_every: 25                  # print Tier3 progress every N pairs (flush)
+  temperature: 0.0
+  prompt_path: "prompts/tier3_adjudicate.txt"
+  json_schema_path: "prompts/tier3_output.schema.json"
+  decision_cache:
+    enabled: true
+    path: "data/decisions/tier3_cache_v3_final.jsonl"
+    key: "normalized_pair_signature"      # sorted pair of normalized names + court + role
+  routing:
+    require_same_block: true
+    require_similarity_in:
+      low: 0.72
+      high: 0.92
+    skip_if_barrier_and_no_supporting_evidence: true
+  budget:
+    target_mention_fraction_min: 0.05
+    target_mention_fraction_max: 0.15
+  # Coerce MATCH/NO_MATCH → UNCERTAIN when model confidence is below this
+  # (applies to non-barrier pairs; also applies to barrier NO_MATCH).
+  abstain_confidence_below: 60
+  # Barrier-flagged pairs: LLM MATCH is allowed only at/above this confidence.
+  # Below it → abstain. Barrier still blocks Tier2 auto-merge only.
+  barrier_llm_min_confidence: 80
+  # Abort cascade if Tier3 LLM error rate exceeds this (see engine/preflight.py)
+  max_error_rate: 0.01
+
+# -----------------------------------------------------------------------------
+# Tier 4 — RAG (deferred; do not enable until Tier0–3 proven)
+# -----------------------------------------------------------------------------
+tier4:
+  enabled: false
+  triggers:
+    - decision: UNCERTAIN
+    - signals: ["rebrand", "alias", "name_change", "aka", "formerly"]
+  sources:
+    - wikidata
+  writeback: temporally_scoped_alias_triples
+
+# -----------------------------------------------------------------------------
+# Clustering + safety rail (A5)
+# -----------------------------------------------------------------------------
+clustering:
+  algorithm: union_find
+  verify_merges: true
+  # Both UF components ≥ this size → Tier2 must not auto-merge; Tier3 MATCH
+  # requires barrier_llm_min_confidence (LLM re-verification).
+  large_cluster_verify_min_size: 5
+  reject_if:
+    - transfer_clue_conflict                 # X transferred to Y ⇒ X ≠ Y
+    - both_have_distinct_fjc_nids
+  sentinel_labels:
+    - Ambiguous
+    - Judicial_Actor
+    - Inconclusive
+  id_prefix: "SJ"                         # SCALES Judicial ID style (V2 JEL)
+
+# -----------------------------------------------------------------------------
+# Provenance journal
+# -----------------------------------------------------------------------------
+provenance:
+  decisions_path: "data/decisions/decisions.jsonl"
+  required_fields:
+    - decision_id
+    - mention_id_a
+    - mention_id_b
+    - entity_type
+    - decision                             # MATCH | NO_MATCH | UNCERTAIN | MERGE_TIER0 | ...
+    - confidence
+    - method                               # tier0.* | tier2.* | tier3.* | ...
+    - rationale
+    - evidence
+    - timestamp
+    - config_version
+
+# -----------------------------------------------------------------------------
+# RDF emission (SCALES PACER vocabulary — verified local ontology)
+# -----------------------------------------------------------------------------
+# Base ontology verified at:
+#   pacer_kg/tentris/ontology.ttl  (prefix pacer: <http://scales-kg.org/pacer#>)
+# Existing classes usable now: pacer:Judge, pacer:Case, pacer:DocketEntry
+# Existing predicates: pacer:assignedJudge, pacer:referredTo, pacer:hasName, ...
+#
+# V3 provenance/mention classes below are EXTENSIONS (not yet in ontology.ttl).
+# They are namespaced under the same pacer: prefix for FRINK compatibility,
+# but MUST be reviewed before production Tentris load.
+rdf:
+  ontology_ref: "data/external/scales_pacer_ontology.ttl"
+  base: "http://scales-kg.org/pacer#"
+  id_base: "http://scales-kg.org/id/"
+  graph_uri: "http://scales-kg.org/graph/tier_v3_judges"
+
+  use_existing:
+    classes: ["Judge", "Case", "Court", "DocketEntry"]
+    predicates:
+      - assignedJudge
+      - referredTo
+      - filedIn
+      - hasName
+      - hasUcid
+      - hasCaseId
+      - hasCaseType
+      - hasFilingDate
+      - hasCode
+
+  extensions_pending_review:
+    classes:
+      - JudgeMention
+      - ResolutionDecision
+      - EntityCluster
+    predicates:
+      - hasSJID
+      - hasFjcNid
+      - mentionsJudge
+      - resolvedTo
+      - hasConfidence
+      - hasMethod
+      - hasRationale
+      - hasAlias
+      - aliasValidFrom
+      - aliasValidTo
+
+  store:
+    # Tentris currently unreachable at localhost:9080 in this environment.
+    # Dev default: Oxigraph local; prod: Tentris when available.
+    dev_backend: oxigraph
+    prod_backend: tentris
+    tentris_sparql: "http://localhost:9080/sparql"
+    tentris_update: "http://localhost:9080/update"
+
+# -----------------------------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------------------------
+evaluation:
+  gold:
+    # BLOCKER: existing gold does NOT cover the 1000 pilot JSONs.
+    #   - v3_judge_er/.../judge_disambiguation.jsonl → 0 UCID overlap with pilot_1000
+    #   - sample JEL/SEL under research_dev public_v2 → 0 UCID overlap with pilot_1000
+    # Workflow step 0 requires generating V2 JEL/SEL on these 1000 files first.
+    jel_path: "data/gold/JEL.jsonl"
+    sel_path: "data/gold/SEL.jsonl"
+  metrics:
+    - pairwise_precision
+    - pairwise_recall
+    - pairwise_f1
+    - b3_precision
+    - b3_recall
+    - b3_f1
+    - confidence_calibration
+    - llm_mention_fraction
+    - tier2_marginal_recall
+
+# -----------------------------------------------------------------------------
+# Incremental mode
+# -----------------------------------------------------------------------------
+incremental:
+  enabled: true
+  # Target registry for incremental REUSE/CREATE (NID-corrected 2026-08-17).
+  # cluster.py writes a *run-local* sibling of clusters_out; it does not overwrite this file.
+  registry_path: "data/runs/judges_pilot_recall_fix/clusters/judges_entity_registry.jsonl"
+  mode_after_bulk: match_against_registry
+  holdout_test:
+    n_files: 20
+    assert_no_duplicate_entities: true

@@ -1,0 +1,26 @@
+# Tier_V3 — free/open-source stack (pin after first successful pilot)
+# Requires Python 3.10+ (do NOT put python>=3.10 here — pip treats it as a package)
+
+# Config / IO
+pyyaml>=6.0
+pandas>=2.0
+tqdm>=4.66
+
+# Embeddings + ANN (Tier 2)
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+numpy>=1.26
+
+# LLM client (Tier 3 via Ollama)
+ollama>=0.3
+jsonschema>=4.22
+
+# NER (optional docket-entry source; V2-validated path)
+spacy>=3.7
+
+# RDF / local KG (dev)
+rdflib>=7.0
+# oxigraph Python bindings optional; CLI oxigraph also acceptable
+
+# Fuzzy helpers (blocking / normalization aids) — imported at module load by engine.tiers
+rapidfuzz>=3.0

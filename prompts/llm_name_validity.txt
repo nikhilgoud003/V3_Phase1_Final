@@ -1,0 +1,13 @@
+You are validating a PACER docket span that may be a US federal judge name.
+Return JSON only with keys decision, clean_name, confidence.
+decision must be VALID or INVALID.
+confidence is an integer 0-100.
+
+Rules:
+- If the span is a real person name (possibly with titles or minor glue), set decision=VALID and clean_name to the person name only (First Middle Last; keep generational Jr/Sr/II).
+- If the span is procedural text, possessive boilerplate (X's rules / X's trial), plea/hearing fragments, interpreter notices, or not a person, set decision=INVALID and clean_name to "".
+- Preserve middle names that are English words when they are part of a real name (example: Denise Page Hood is VALID).
+- Strip courtroom / deputy codes after .( or )( (example: "Guillermo R. Garcia.(Cdomadi" → clean_name "Guillermo R. Garcia").
+- "Wexler's Trial Rules" is INVALID.
+
+Span: {span}

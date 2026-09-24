@@ -1,0 +1,28 @@
+{
+  "title": "Tier3AdjudicationResult",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["decision", "confidence", "rationale"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["MATCH", "NO_MATCH", "UNCERTAIN"]
+    },
+    "confidence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "signals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

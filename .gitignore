@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+*.pem
+credentials.json
+
+# Input PACER dockets (place locally; do not commit)
+data/json/**
+!data/json/.gitkeep
+
+# Run outputs (generated locally)
+data/runs/**
+!data/runs/.gitkeep
+
+# Local Tentris datastores
+data/tentris_*/
+*.ttl.bak
+
+# Tentris debug
+.tentris-debug-log.json

@@ -1,0 +1,35 @@
+{
+  "title": "Tier3AdjudicationResultParties",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["decision", "confidence", "rationale", "cited_evidence"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["MATCH", "NO_MATCH", "UNCERTAIN"]
+    },
+    "confidence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "cited_evidence": {
+      "type": "array",
+      "description": "Evidence-bundle / mention claim keys this decision relies on. Code verifies each claim; false claims force UNCERTAIN.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "signals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

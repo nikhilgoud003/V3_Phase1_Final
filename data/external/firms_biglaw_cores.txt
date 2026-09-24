@@ -1,0 +1,65 @@
+# Seed Big Law / AmLaw-style firm cores (normalized, lowercase, no corp suffix).
+# Extend from V2 hybrid-350 list as needed. Used by configs/firms.yaml office_classification.big_law.
+kirkland and ellis
+skadden arps slate meagher and flom
+sullivan and cromwell
+cravath swaine and moore
+wachtell lipton rosen and katz
+davis polk and wardwell
+simpson thacher and bartlett
+cleary gottlieb steen and hamilton
+debevoise and plimpton
+paul weiss rifkind wharton and garrison
+latham and watkins
+gibson dunn and crutcher
+jones day
+morgan lewis and bockius
+sidley austin
+white and case
+weil gotshal and manges
+baker mckenzie
+dla piper
+norton rose fulbright
+hogan lovells
+reed smith
+proskauer rose
+wilmerhale
+covington and burling
+arnold and porter
+morrison and foerster
+orrick herrington and sutcliffe
+cooley
+wilson sonsini goodrich and rosati
+quinn emanuel urquhart and sullivan
+boies schiller and flexner
+baker botts
+vinge and elkins
+akingump strauss hauer and feld
+perkins coie
+shearman and sterling
+milbank
+willkie farr and gallagher
+fried frank harris shriver and jacobson
+cahill gordon and reindel
+ropes and gray
+goodwin procter
+foley and lardner
+mayer brown
+k and l gates
+holland and knight
+greenberg traurig
+mcdermott will and emery
+dentons
+squire patton boggs
+baker hostetler
+blank rome
+fox rothschild
+duane morris
+troutman pepper
+alston and bird
+king and spalding
+bradley arant
+balch and bingham
+butler snow
+hunton andrews kurth
+lockelord

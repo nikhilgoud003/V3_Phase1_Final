@@ -1,0 +1,589 @@
+# =============================================================================
+# Tier_V3 entity-type config — FIRMS (generality proof)
+# =============================================================================
+# Port of V2 firm taxonomy / strong keys into config data (not Python branches).
+# Engine must remain type-agnostic. Extraction paths verified on pilot_1000:
+#   parties[].counsel[].entity_info.{office_name,address,phone,email}
+# Domain is derived from email (local-part@domain) — no separate domain field
+# in PACER JSON.
+#
+# Generic nested-path walker: engine/path_extract.py (approved design fix).
+# =============================================================================
+
+entity_type: firm
+# Intentional taxonomy: "firm" covers Big Law / USAO / AG / FPD / DOJ /
+# city-county-state under one office-resolution track (matches V2 scope).
+# Government legal offices are not a separate entity_type.
+version: "1.0.0"
+description: >
+  PACER counsel office / law-firm mentions extracted from
+  parties[].counsel[].entity_info. Office-name classification
+  (Big Law / AG / DOJ / FPD / city-county-state / prisoner-noise)
+  is config data for blocking + Tier0 subclass joins.
+
+io:
+  json_glob: "data/json/pilot_1000/*.json"
+  mentions_out: "data/mentions/firms_mentions.jsonl"
+  decisions_out: "data/decisions/firms_decisions.jsonl"
+  clusters_out: "data/clusters/firms_entities.jsonl"
+  embeddings_dir: "data/embeddings/firms"
+  rdf_out: "data/rdf/firms.ttl"
+  reports_dir: "data/reports"
+
+extraction:
+  case_meta:
+    ucid: "ucid"
+    court: "court"
+    case_id: "case_id"
+    case_type: "case_type"
+    case_name: "case_name"
+    filing_date: "filing_date"
+    terminating_date: "terminating_date"
+    year_from: "filing_date"
+
+  sources:
+    - id: counsel_office
+      path: "parties[].counsel[].entity_info.office_name"
+      kind: string_or_null
+      role: office
+      docket_source: case_parties
+      extraction_method: counsel_office_name
+      enabled: true
+      carry_fields:
+        party_enum: "$party_index"
+        counsel_enum: "$counsel_index"
+        party_name: "parties[].name"
+        party_role: "parties[].role"
+        counsel_name: "parties[].counsel[].name"
+        address: "parties[].counsel[].entity_info.address"
+        phone: "parties[].counsel[].entity_info.phone"
+        fax: "parties[].counsel[].entity_info.fax"
+        email: "parties[].counsel[].entity_info.email"
+      derive_fields:
+        domain: "email_domain"   # engine helper: split email at @
+
+  # Generic same-case fill: empty payload + flag → copy from sibling with
+  # the same match_field whose payload has donor_requires_key populated.
+  record_copy_fill:
+    enabled: true
+    list_path: "parties[].counsel[]"
+    match_field: name
+    flag_field: has_see_above
+    payload_field: entity_info
+    donor_requires_key: office_name
+    ignore_payload_keys: [raw_info, terminating_date]
+
+  # Generic boolean skip on the walked context object (not string matching).
+  skip_record_if:
+    - context_object: counsel
+      field: is_pro_se
+      equals: true
+
+  negative_evidence:
+    party_names_path: "parties[].name"
+    counsel_names_path: "parties[].counsel[].name"
+    match_mode: exact_normalized
+    apply_counsel_names: false        # office name may equal counsel person string
+
+  office_name_default: raw            # mention.office_name ← extracted span
+
+  transfer_clues:
+    enabled: false
+    path: "docket[].docket_text"
+    patterns: []
+
+  drop_literals:
+    - "none"
+    - "n/a"
+    - "na"
+    - "unknown"
+    - "pro se"
+    - "prose"
+
+# -----------------------------------------------------------------------------
+# Office-name classification (V2 taxonomy → config data)
+# Applied after normalize; sets mention.office_subclass + mention.office_class.
+# First matching class wins (order = priority).
+# -----------------------------------------------------------------------------
+office_classification:
+  enabled: true
+  classes:
+    - id: prisoner_noise
+      subclass_field: null
+      drop_mention: true          # do not enter ER pool
+      patterns:
+        - '(?i)^\d{4,}$'
+        - '(?i)^\d{2,}-\d{2,}-\d{2,}$'
+        - '(?i)\breg(istration)?\s*#?\s*\d'
+        - '(?i)\b(inmate|prisoner|bop|bureau of prisons)\b'
+
+    - id: doj
+      subclass_from: capture_group_1   # state / united states tag
+      patterns:
+        - '(?i)\b(u\.?\s*s\.?\s*)?(department of justice|doj)\b'
+        - '(?i)\b(united states|u\.?\s*s\.?)\s+(attorney|attorney.?s office|attorneys office)\b'
+        - '(?i)\busao\b'
+
+    - id: ag
+      subclass_from: state_match
+      patterns:
+        - '(?i)\b(attorney\s+general|office of the attorney general|oag)\b'
+        - '(?i)\bstate\s+attorney\b'
+
+    - id: fpd
+      subclass_from: court_or_name
+      patterns:
+        - '(?i)\b(federal\s+)?(public|community)\s+defender'
+        - '(?i)\bfederal\s+defender'
+        - '(?i)\bfpd\b'
+        - '(?i)\boffice of (the )?federal defender'
+
+    - id: city_county_state
+      subclass_from: gpe_match
+      patterns:
+        - '(?i)\b(city|county|parish|borough)\s+(of\s+)?[a-z].{0,40}\b(attorney|counsel|solicitor|prosecutor)'
+        - '(?i)\b(corporation counsel|city attorney|county attorney|district attorney|state attorney)\b'
+        - '(?i)\b(solicitor general|prosecutor.?s office)\b'
+
+    - id: big_law
+      subclass_from: biglaw_id
+      # Match against listed firm cores (normalized). Full AmLaw/hybrid-350
+      # list lives in data/external/firms_biglaw_cores.txt (one name per line).
+      list_path: "data/external/firms_biglaw_cores.txt"
+      patterns: []   # optional extra regexes beyond the list
+
+    - id: private_other
+      subclass_from: null
+      patterns:
+        - '(?i).'   # residual catch-all — keep last
+
+normalization:
+  lowercase: true
+  strip_honorifics: []
+  # Corporate suffixes stripped for matching keys (kept on presentable)
+  strip_corp_suffixes:
+    - "llp"
+    - "lllp"
+    - "llc"
+    - "pllc"
+    - "pc"
+    - "p.c."
+    - "p.c"
+    - "pa"
+    - "p.a."
+    - "ltd"
+    - "ltd."
+    - "inc"
+    - "inc."
+    - "l.l.p."
+    - "l.l.c."
+    - "chtd"
+    - "chartered"
+  strip_chars: ".,;:\"()[]{}"
+  # Apostrophes deleted (Attorney's → Attorneys), not mapped to spaces.
+  delete_chars: "'\u2019\u2018"
+  collapse_whitespace: true
+  # Class 3: strip PACER procedural/admin prefixes glued onto office_name
+  # (pattern family — not a firm-name list). See strip_procedural_office_prefixes.
+  strip_procedural_prefixes: true
+  presentable_case: title
+  replace_tokens:
+    "&": " and "
+    "+": " and "
+  # Whole-token institutional abbreviations (not firm-name lists).
+  replace_regex:
+    - pattern: '(?i)(?<![A-Za-z])u\.?\s*s\.?(?![A-Za-z])'
+      replacement: "united states"
+    - pattern: '(?i)\busao\b'
+      replacement: "united states attorneys office"
+    - pattern: '(?i)\bdoj\b'
+      replacement: "department of justice"
+  # Trailing "Name - location-fragment" → canonical name + office_location.
+  # Also peels suite/room/street/courthouse glued without a dash (second pass).
+  trailing_location:
+    enabled: true
+    separators:
+      - " - "
+      - " – "
+      - " — "
+      - "\n"
+    remainder_patterns:
+      # Ends with comma + 2-letter state (optional ZIP). Not a mid-string ", El".
+      - '(?i),\s*[A-Za-z]{2}(\s+\d{5}(-\d{4})?)?\s*$'
+      # Street-type token after a word (avoid matching "St. Louis" via bare \bst\b).
+      - '(?i)\b[A-Za-z0-9.]+\s+(ave|avenue|street|blvd|boulevard|rd|road|dr|drive|ln|lane|pkwy|parkway|hwy|highway|ste|suite|fl|floor|cir|circle|pl|place)\.?\b'
+      - '(?i)\b[A-Za-z0-9.]+\s+st\.\b'
+      # Entire remainder is "City, ST"
+      - "(?i)^[A-Za-z][A-Za-z .'-]{0,40},\\s*[A-Za-z]{2}\\s*$"
+      # Remainder is suite/room alone ("Suite 700") or building+suite/courthouse.
+      - '(?i)^(suite|ste\.?|room|rm\.?)\s+\S+'
+      - '(?i).*\b(suite|ste\.?|room|rm\.?|street|avenue|ave\.?|blvd|courthouse)\b.*'
+    # No-separator peel (end-anchored). Keeps ≥ min_core_tokens on the left.
+    trailing_junk_patterns:
+      - '(?i)[,;\s]+(suite|ste\.?|room|rm\.?)\s+[\w-]+\s*$'
+      - '(?i)\s+\d{1,5}\s+[A-Za-z0-9 .''-]{1,60}\b(street|st\.|avenue|ave\.?|blvd|boulevard|rd|road|dr|drive)\b.*$'
+      - '(?i)\s+[A-Za-z0-9 .''-]{2,50}\bcourthouse\b.*$'
+      - '(?i)\s*\([^)]*\d[^)]*\)\s*$'
+    trailing_junk_chars: "*"
+    min_core_tokens: 2
+
+mention_hygiene:
+  enabled: true
+  low_info_within_ucid_only: true
+
+name_compat:
+  enabled: true
+  max_surname_edit_distance: 2   # firm names are longer; allow minor spelling drift
+  # Class 3: a single shared partner/surname token is not firm identity when
+  # domain, phone, and address all disagree. Require a shared content bigram
+  # (or exact normalized equality) before allowing the name gate to pass.
+  refuse_surname_only_when_contacts_differ: true
+
+name_validity:
+  enabled: false   # firm multi-word English strings; judge name gate not applicable
+  reject_single_char_second_token: false
+  quarantine_out: "data/mentions/quarantine_firms_name_validity.jsonl"
+  procedural_stopwords: []
+  whitelist:
+    use_fjc_surnames: false
+    use_fjc_full_names: false
+
+name_repair:
+  enabled: false   # judge docket-prose repair not applicable to office names
+
+profile_template: >
+  Firm: {normalized_name}
+  | Presentable: {presentable_name}
+  | Class: {office_class}
+  | Subclass: {office_subclass}
+  | Domain: {domain}
+  | Phone: {phone}
+  | Location: {office_location}
+  | OfficeState: {office_state}
+  | OfficeCity: {office_city}
+  | Address: {address}
+  | Court: {court}
+  | CaseType: {case_type}
+  | UCID: {ucid}
+  | Year: {year}
+  | Party: {party_name}
+
+# -----------------------------------------------------------------------------
+# Identity exclusions — ONE source of truth for T0 forbid + T3 non-identifying
+# -----------------------------------------------------------------------------
+# Shared / institutional / free-mail domains are never firm identity evidence.
+# Institutional office classes get office_state derived from address (not case court).
+identity_exclusions:
+  non_identifying_domains: &non_identifying_domains
+    - gmail.com
+    - yahoo.com
+    - hotmail.com
+    - outlook.com
+    - aol.com
+    - icloud.com
+    - msn.com
+    - live.com
+    - comcast.net
+    - sbcglobal.net
+    - verizon.net
+    - att.net
+    - cox.net
+    - charter.net
+    - bellsouth.net
+    - pacbell.net
+    - earthlink.net
+    - optonline.net
+    - juno.com
+    - netzero.net
+    - usdoj.gov
+    - fd.org
+  non_identifying_domain_suffixes: &non_identifying_domain_suffixes
+    - ".gov"
+    - ".rr.com"
+  institutional_office_classes: &institutional_office_classes
+    - doj
+    - fpd
+    - ag
+    - city_county_state
+  generic_office_names: &generic_office_names
+    - attorney at law
+    - attorneys at law
+    - attorney
+    - attorneys
+    - counsel
+    - esquire
+    - law office
+    - law offices
+
+# -----------------------------------------------------------------------------
+# Tier 0 — strong keys (V2 firm identity signals)
+# -----------------------------------------------------------------------------
+tier0:
+  enabled: true
+  rules:
+    - id: office_domain
+      description: "Same office_name + email domain + court → same firm (usdoj.gov / fd.org are nationwide)"
+      type: conjunction
+      fields: [normalized_name, domain, court]
+      require_non_null: [domain, court]
+      min_name_tokens: 1
+      confidence: 100
+      method: tier0.office_domain
+
+    # Court-free firm-specific domain joins. Not a firm-name list: domain is the
+    # evidence; institutional / free-mail / ISP / generic office labels are excluded
+    # via identity_exclusions (single source of truth).
+    - id: office_domain_nationwide
+      description: "Firm-specific email domain + first two name tokens → same firm, any court"
+      type: conjunction
+      fields: [first_two_tokens, domain]
+      require_non_null: [domain]
+      min_name_tokens: 2
+      match:
+        forbid_office_class: *institutional_office_classes
+        forbid_domains: *non_identifying_domains
+        forbid_domain_suffixes: *non_identifying_domain_suffixes
+        forbid_normalized_names: *generic_office_names
+      confidence: 97
+      method: tier0.office_domain_nationwide
+
+    - id: office_domain_nationwide_exact
+      description: "Firm-specific email domain + exact office name → same firm, any court (1-token names)"
+      type: conjunction
+      fields: [normalized_name, domain]
+      require_non_null: [domain]
+      min_name_tokens: 1
+      match:
+        forbid_office_class: *institutional_office_classes
+        forbid_domains: *non_identifying_domains
+        forbid_domain_suffixes: *non_identifying_domain_suffixes
+        forbid_normalized_names: *generic_office_names
+      confidence: 96
+      method: tier0.office_domain_nationwide_exact
+
+    - id: office_address
+      description: "Same office_name + exact address → same firm"
+      type: conjunction
+      fields: [normalized_name, address]
+      require_non_null: [address]
+      min_name_tokens: 1
+      confidence: 99
+      method: tier0.office_address
+
+    - id: office_phone
+      description: "Same office_name + phone → same firm"
+      type: conjunction
+      fields: [normalized_name, phone]
+      require_non_null: [phone]
+      min_name_tokens: 1
+      confidence: 99
+      method: tier0.office_phone
+
+    - id: biglaw_subclass
+      description: "Same Big Law subclass id (AmLaw core) → same firm entity"
+      type: conjunction
+      fields: [office_subclass, office_class]
+      require_non_null: [office_subclass]
+      # only fire when office_class == big_law (engine filters via match.require)
+      match:
+        require: [office_class_equals_big_law]
+      confidence: 98
+      method: tier0.biglaw_subclass
+
+    - id: exact_name_court
+      description: "Identical normalized office name + court (weak fallback)"
+      type: conjunction
+      fields: [normalized_name, court]
+      min_name_tokens: 2
+      confidence: 90
+      method: tier0.exact_name_court
+
+  fjc_date_policy:
+    mode: soft_evidence
+    weight_in_band_score: 0
+    allow_post_termination_mentions: true
+
+# -----------------------------------------------------------------------------
+# Tier 1 — blocking
+# -----------------------------------------------------------------------------
+# Domain is the strongest firms anchor, but usdoj.gov / fd.org are shared
+# nationwide (every USAO / many FPDs). Block on court+domain, never domain
+# alone — otherwise every US Attorney's Office would share one candidate set.
+# Institutional classes also block on office_state (from address), not case court.
+# -----------------------------------------------------------------------------
+tier1:
+  enabled: true
+  strategies:
+    - id: domain
+      key_template: "domain|{court}|{domain}"
+      fields: {court: court, domain: domain}
+
+    - id: phone
+      key_template: "phone|{phone}"
+      fields: {phone: phone}
+
+    - id: court_surname
+      key_template: "{court}|{surname}"
+      fields: {court: court, surname: surname_from_normalized_name}
+
+    - id: office_class
+      key_template: "class|{court}|{office_class}|{office_subclass}"
+      fields: {court: court, office_class: office_class, office_subclass: office_subclass}
+
+    - id: institutional_office_state
+      key_template: "inst|{office_class}|{office_state}"
+      fields: {office_class: office_class, office_state: office_state}
+
+    - id: court_name_prefix
+      key_template: "{court}|{name_prefix}"
+      fields: {court: court, name_prefix: first_two_tokens}
+
+  residual_bucket: "_UNBLOCKED_"
+
+# -----------------------------------------------------------------------------
+# Tier 2 — embeddings
+# -----------------------------------------------------------------------------
+tier2:
+  enabled: true
+  backend: ollama_faiss
+  ollama_embed_model: "nomic-embed-text"
+  model: "nomic-embed-text"
+  fallback_model: "rapidfuzz"
+  index:
+    backend: faiss
+    metric: ip
+    path: "data/embeddings/firms/faiss.index"
+    id_map_path: "data/embeddings/firms/id_map.jsonl"
+  search:
+    top_k: 25
+    min_similarity: 0.72
+    auto_merge_min: 0.92
+    ambiguous_low: 0.72
+    ambiguous_high: 0.92
+  marginal_recall:
+    enabled: true
+
+information_content_barrier:
+  enabled: true
+  triggers:
+    - id: single_token_name
+      rule: "token_count(normalized_name) == 1"
+    - id: prisoner_or_noise_class
+      rule: "office_class == prisoner_noise"
+    - id: generic_office_label
+      rule: "normalized_name in {law office, law offices, attorney at law, attorneys at law}"
+  on_trigger:
+    allow_tier0: true
+    allow_tier2_auto_merge: false
+    allow_tier2_candidate: true
+    auto_send_to_llm: false
+
+# -----------------------------------------------------------------------------
+# Tier 3 — firm-specific prompt guidance (same schema as judges)
+# -----------------------------------------------------------------------------
+tier3:
+  enabled: true
+  backend: ollama
+  model: "qwen2.5:7b"
+  endpoint: "http://localhost:11434"
+  progress_log_every: 25
+  temperature: 0.0
+  prompt_path: "prompts/tier3_adjudicate_firms.txt"
+  json_schema_path: "prompts/tier3_output.schema.json"
+  decision_cache:
+    enabled: true
+    path: "data/decisions/firms_tier3_cache.jsonl"
+    key: "normalized_pair_signature"
+  routing:
+    require_same_block: true
+    require_similarity_in:
+      low: 0.72
+      high: 0.92
+    skip_if_barrier_and_no_supporting_evidence: true
+  budget:
+    target_mention_fraction_min: 0.05
+    target_mention_fraction_max: 0.15
+  abstain_confidence_below: 60
+  barrier_llm_min_confidence: 80
+  max_error_rate: 0.02
+  max_consecutive_errors: 5  # allow brief Ollama restart windows; loop script also resumes
+
+tier4:
+  enabled: false
+  triggers:
+    - decision: UNCERTAIN
+    - signals: ["rebrand", "alias", "name_change", "aka", "formerly", "merger"]
+  sources: [wikidata]
+  writeback: temporally_scoped_alias_triples
+
+clustering:
+  algorithm: union_find
+  verify_merges: true
+  large_cluster_verify_min_size: 8
+  reject_if: []
+  sentinel_labels: [Ambiguous, Inconclusive]
+  id_prefix: "SF"
+  # Firms consistency invariants (checked by scripts/firms_verify.py)
+  consistency_checks:
+    - id: domain_unique_entity
+      rule: "same non-null firm domain never in two entities (exclude free-mail + shared institutional domains)"
+    - id: address_phone_cohesion
+      rule: "same exact (address, phone) never split across entities"
+
+provenance:
+  decisions_path: "data/decisions/firms_decisions.jsonl"
+  required_fields:
+    - decision_id
+    - mention_id_a
+    - mention_id_b
+    - entity_type
+    - decision
+    - confidence
+    - method
+    - rationale
+    - evidence
+    - timestamp
+    - config_version
+
+rdf:
+  ontology_ref: "data/external/scales_pacer_ontology.ttl"
+  base: "http://scales-kg.org/pacer#"
+  id_base: "http://scales-kg.org/id/"
+  graph_uri: "http://scales-kg.org/graph/tier_v3_firms"
+  entity_class: LawFirm
+  entity_id_kind: firm
+  mention_class: FirmMention
+  id_predicate: hasSFID
+  # Structural namespace away from live judges /id/{alias,resolution,mention}/…
+  alias_id_kind: firm_alias
+  resolution_id_kind: firm_resolution
+  mention_id_kind: firm_mention
+  # Always mint content-hashed alias/decision keys (judges registry-aware scheme)
+  content_hash_uris: true
+  use_existing:
+    classes: [LawFirm, Case, Court]
+    predicates: [hasName, hasUcid, hasCode]
+  extensions_pending_review:
+    classes: [FirmMention, ResolutionDecision, NameAssertion]
+    predicates: [hasSFID, hasDomain, hasPhone, hasAddress, assertsNameFor, hasCounselOffice]
+  store:
+    dev_backend: oxigraph
+    prod_backend: tentris
+    tentris_sparql: "http://localhost:9080/sparql"
+    tentris_update: "http://localhost:9080/update"
+
+evaluation:
+  gold:
+    jel_path: null
+    sel_path: null
+  metrics:
+    - llm_mention_fraction
+    - domain_consistency
+    - address_phone_cohesion
+    - stratified_human_audit
+
+incremental:
+  enabled: true
+  # Run-of-record registry (not deleted scratch data/clusters/)
+  registry_path: "data/runs/firms_pilot/clusters/firms_entity_registry.jsonl"
+  mode_after_bulk: match_against_registry

@@ -1,0 +1,662 @@
+# =============================================================================
+# Tier_V3 entity-type config — PARTIES (litigants)
+# =============================================================================
+# Same engine as judges/firms. Zero type-specific Python required for v0.
+# Extraction: parties[].name (+ role / party_type / pacer_id carry).
+#
+# Discipline (mirrors firms):
+#   - Engine untouched until judges regression proof passes
+#   - Three-round human audit before Tentris load
+#   - V2 (research_dev party pipeline) comparison for validation
+#   - RDF namespaces must not collide with /id/judge|firm|… (see
+#     docs/PARTIES_START.md § RDF collision)
+#
+# Deferred (needs design or engine — do NOT invent in Python yet):
+#   - aka / dba / fka / nominee multi-entity splits (V2 _party_extract)
+#
+# USA / United States alias collapse: Tier0 alias_groups (not Tier3 prompt).
+# =============================================================================
+
+entity_type: party
+version: "0.7.3"
+description: >
+  PACER case-party (litigant) mentions from parties[].name.
+  Includes natural persons and organizational litigants (USA, banks,
+  agencies, corporations). Not counsel offices (firms) and not judges.
+
+io:
+  json_glob: "data/json/pilot_1000/*.json"
+  mentions_out: "data/mentions/parties_mentions.jsonl"
+  decisions_out: "data/decisions/parties_decisions.jsonl"
+  clusters_out: "data/clusters/parties_entities.jsonl"
+  embeddings_dir: "data/embeddings/parties"
+  rdf_out: "data/rdf/parties.ttl"
+  reports_dir: "data/reports"
+
+extraction:
+  case_meta:
+    ucid: "ucid"
+    court: "court"
+    case_id: "case_id"
+    case_type: "case_type"
+    case_name: "case_name"
+    filing_date: "filing_date"
+    terminating_date: "terminating_date"
+    year_from: "filing_date"
+
+  sources:
+    - id: party_name
+      path: "parties[].name"
+      kind: string_or_null
+      role: party
+      docket_source: case_parties
+      extraction_method: party_name
+      enabled: true
+      carry_fields:
+        party_enum: "$party_index"
+        party_name: "parties[].name"
+        party_role: "parties[].role"
+        party_type: "parties[].party_type"
+        pacer_id: "parties[].pacer_id"
+        address: "parties[].entity_info.address"
+        phone: "parties[].entity_info.phone"
+        fax: "parties[].entity_info.fax"
+        email: "parties[].entity_info.email"
+      derive_fields:
+        domain: "email_domain"
+
+  negative_evidence:
+    party_names_path: "parties[].name"
+    counsel_names_path: "parties[].counsel[].name"
+    match_mode: exact_normalized
+    # Party spans ARE party names — do not self-drop (mirrors firms'
+    # apply_counsel_names: false). Judges keep default true.
+    apply_party_names: false
+    apply_counsel_names: false
+
+  office_name_default: null
+
+  transfer_clues:
+    enabled: false
+    path: "docket[].docket_text"
+    patterns: []
+
+  drop_literals:
+    - "none"
+    - "n/a"
+    - "na"
+    - "unknown"
+
+# -----------------------------------------------------------------------------
+# Litigant classification (same generic engine hook as firms office_classification)
+# Sets mention.office_class / office_subclass via apply_office_classification().
+# First matching class wins (order = priority).
+# -----------------------------------------------------------------------------
+office_classification:
+  enabled: true
+  classes:
+    - id: prisoner_noise
+      subclass_from: null
+      drop_mention: true
+      patterns:
+        - '(?i)^\d{4,}$'
+        - '(?i)^\d{2,}-\d{2,}-\d{2,}$'
+        - '(?i)\breg(istration)?\s*#?\s*\d'
+        - '(?i)\b(inmate|prisoner|bop|bureau of prisons)\b'
+
+    - id: placeholder
+      subclass_from: null
+      patterns:
+        - '(?i)^john doe(\s+\d+)?$'
+        - '(?i)^jane doe(\s+\d+)?$'
+        - '(?i)\b(john|jane)\s*/?\s*(john|jane)?\s*does?\b'
+        - '(?i)\bdoe\s+subscriber\b'
+        - '(?i)^unknown\b'
+        - '(?i)^doe\b'
+
+    - id: government
+      subclass_from: capture_group_1
+      patterns:
+        - '(?i)^(united states of america|united states)$'
+        - '(?i)^state of\s+([a-z][a-z\s]+)$'
+        - '(?i)\bex rel\b'
+        - '(?i)\b(department|dept)\s+of\s+'
+        - '(?i)\b(sec|securities and exchange commission|fda|epa|ftc)\b'
+
+    - id: corporate
+      subclass_from: null
+      patterns:
+        - '(?i)\b(inc|incorporated|corp|corporation|llc|llp|ltd|limited|company|co|ag|plc|gmbh)\s*\.?\s*$'
+        - '(?i)\b(industries|holdings|enterprises|group|partners)\b'
+        - '(?i)\s&\s'
+
+    - id: nominal_person
+      subclass_from: null
+      patterns:
+        - '(?i)^[a-z][a-z''-]+ [a-z][a-z''-]+(\s+[a-z][a-z''-]+)?$'
+
+    - id: private_other
+      subclass_from: null
+      patterns:
+        - '(?i).'
+
+normalization:
+  lowercase: true
+  strip_punctuation: true
+  strip_chars: ".,;:\"'()[]{}"
+  collapse_whitespace: true
+  generational_suffixes: ["jr", "sr", "ii", "iii", "iv", "md", "phd", "esq"]
+  # Same strip_corp_suffixes hook as firms (engine/normalize.strip_corp_suffixes).
+  strip_corp_suffixes:
+    - "llp"
+    - "lllp"
+    - "llc"
+    - "pllc"
+    - "pc"
+    - "p.c."
+    - "p.c"
+    - "pa"
+    - "p.a."
+    - "ltd"
+    - "ltd."
+    - "inc"
+    - "inc."
+    - "incorporated"
+    - "corp"
+    - "corporation"
+    - "company"
+    - "co"
+    - "ag"
+    - "plc"
+    - "lp"
+    - "l.p."
+    - "l p"
+    - "gp"
+    - "g.p."
+    - "g p"
+    - "l.l.p."
+    - "l.l.c."
+    - "gmbh"
+  # Conservative expansions for common PACER party strings (config data only).
+  expand_abbreviations:
+    - pattern: '(?i)^u\.?s\.?a\.?$'
+      replacement: "united states of america"
+    - pattern: '(?i)^u\.?s\.?$'
+      replacement: "united states of america"
+    - pattern: '(?i)^united states$'
+      replacement: "united states of america"
+    - pattern: '(?i)^usa$'
+      replacement: "united states of america"
+  # Corporate core key for Tier0/Tier1 (engine/normalize.corp_core_name).
+  corp_core_key:
+    enabled: true
+    hyphen_to_space: true
+    use_strip_corp_suffixes: true
+    max_tokens: null
+
+mention_hygiene:
+  enabled: true
+  low_info_within_ucid_only: true
+
+name_compat:
+  enabled: true
+  max_surname_edit_distance: 1
+  # Bare-initial person names (I.M. vs C.M.) are different people unless
+  # first and last initials agree. Off for judges/firms.
+  all_initials_must_agree: true
+  all_initials_office_classes:
+    - nominal_person
+    - private_other
+    - placeholder
+  # Org hyphen/slash/period/ampersand and spacing variants are one legal name
+  # (Harbison-Walker / Harbison Walker, W.R. / Wr, A.C. And S / Acands).
+  # Off for judges/firms. Does not fold person or placeholder classes, and
+  # does not drop a trailing division token such as "group".
+  punct_fold: true
+  punct_fold_min_collapsed_len: 6
+  punct_fold_office_classes:
+    - corporate
+    - government
+    - private_other
+    # Company strings are often tagged nominal_person (Harbison-Walker,
+    # Owens-Corning). Fold only when the punct-normalized cores are equal,
+    # so this does not merge distinct person names.
+    - nominal_person
+
+name_validity:
+  # Person + org mix; keep off for first extract smoke. Revisit after Round 1.
+  enabled: false
+  reject_single_char_second_token: false
+  quarantine_out: "data/mentions/quarantine_parties_name_validity.jsonl"
+  procedural_stopwords: []
+  whitelist:
+    use_fjc_surnames: false
+    use_fjc_full_names: false
+
+name_repair:
+  enabled: false
+
+profile_template: >
+  Party: {normalized_name}
+  | Presentable: {presentable_name}
+  | Role: {party_role}
+  | PartyType: {party_type}
+  | PacerId: {pacer_id}
+  | Domain: {domain}
+  | Phone: {phone}
+  | Address: {address}
+  | Court: {court}
+  | CaseType: {case_type}
+  | UCID: {ucid}
+  | Year: {year}
+
+# Corporate prefix families: block Tier2 embedding merges that share token-1
+# but differ on token-2 (Owens-Corning vs Owens-Illinois — not a suffix-strip issue).
+identity_exclusions:
+  corporate_shared_prefix_distinct_second_token: true
+  government_jurisdiction_remainder:
+    enabled: true
+    prefixes:
+      - "state of"
+      - "commonwealth of"
+      - "district of"
+      - "city of"
+      - "town of"
+      - "village of"
+      - "county of"
+      - "borough of"
+    strip_trailing_tokens: ["ex", "rel"]
+  division_subsidiary:
+    enabled: true
+    markers:
+      - "/division"
+      - " division of "
+      - " division"
+      - "/services"
+      - "subsidiary"
+      - "sub,"
+      - "subfund"
+      - " group"
+      - "/group"
+    slash_join_distinct_entities: true
+    parent_prefix:
+      enabled: true
+      min_extra_distinctive_tokens: 2
+      subunit_tokens:
+        - department
+        - dept
+        - police
+        - fire
+        - sheriff
+        - office
+        - bureau
+        - commission
+        - committee
+        - agency
+        - authority
+        - board
+        - division
+        - unit
+        - precinct
+        - shareholder
+  fund_plan_type:
+    enabled: true
+    fund_markers: [fund, trust, plan]
+    type_tokens:
+      - health
+      - welfare
+      - pension
+      - retirement
+      - savings
+      - annuity
+      - security
+      - vacation
+      - apprenticeship
+      - training
+  generic_word_overlap:
+    enabled: true
+    words:
+      - gasket
+      - industries
+      - services
+      - fund
+      - trust
+      - holdings
+      - products
+      - manufacturing
+      - supply
+      - equipment
+      - group
+      - partners
+      - associates
+      - international
+      - national
+      - american
+      - asbestos
+      - liability
+      - specialty
+      - systems
+      - lines
+      - incorporated
+      - company
+      - corporation
+      - bank
+      - usa
+      - na
+      - us
+      - product
+      - world
+      - enterprises
+      - manufacturing
+  person_vs_org:
+    enabled: true
+    person_classes: [nominal_person]
+    org_classes: [corporate]
+    min_shared_distinctive_tokens: 2
+  generational_suffix:
+    enabled: true
+    suffixes: [jr, sr, ii, iii, iv, 2nd, 3rd, 4th, junior, senior]
+    # Conflicting suffixes (Sr vs Jr) always block. One-sided (Sr vs bare)
+    # blocks unless same UCID + same role (inconsistent labeling of one person).
+    allow_one_sided_if_same_ucid_and_role: true
+  legal_entity_form:
+    enabled: true
+    # These forms are NOT interchangeable when both sides carry one and they differ.
+    forms:
+      lp: ["l p", "lp", "l.p", "l.p.", "limited partnership"]
+      gp: ["g p", "gp", "g.p", "g.p.", "general partnership"]
+      llc: ["llc", "l.l.c", "l.l.c."]
+      inc: ["inc", "inc.", "incorporated"]
+      trust: ["trust"]
+  placeholder:
+    enabled: true
+    office_class: placeholder
+    never_cross_ucid: true
+    require_identical_name: true
+    name_patterns:
+      - '(?i)\b(john|jane)\s*/?\s*(john|jane)?\s*does?\b'
+      - '(?i)\bdoes?\s+\d'
+      - '(?i)\bdoe\s+subscriber\b'
+  opposing_roles:
+    enabled: true
+    fields: [party_type, party_role]
+    plaintiff_side: [plaintiff, petitioner, appellant]
+    defendant_side: [defendant, respondent, appellee]
+  person_title_prefixes:
+    enabled: true
+    prefixes: ["p/o", "p o"]
+
+# -----------------------------------------------------------------------------
+# Tier 0 — strong keys (conservative; common-name false merges are the risk)
+# -----------------------------------------------------------------------------
+tier0:
+  enabled: true
+  # Government name aliases (USA / U.S. / United States / …). Merged only
+  # within the same UCID at Tier0 — never a global USA entity. Cross-UCID
+  # pairs in this group are excluded from Tier3 (see tier3.routing).
+  alias_groups:
+    - id: united_states_government
+      names:
+        - usa
+        - u s a
+        - u s
+        - us
+        - united states
+        - united states of america
+      merge_scope: same_ucid
+      confidence: 100
+      method: tier0.gov_usa_alias_ucid
+  rules:
+    - id: exact_normalized_name_same_ucid
+      description: "Identical normalized name within the same case → same party mention cluster"
+      type: conjunction
+      fields: [normalized_name, ucid]
+      confidence: 100
+      method: tier0.exact_name_ucid
+
+    - id: exact_normalized_name_same_court_pacer_id
+      description: "Same name + same court + same PACER party id → same litigant"
+      type: conjunction
+      fields: [normalized_name, court, pacer_id]
+      require_non_null: [pacer_id]
+      min_name_tokens: 1
+      confidence: 99
+      method: tier0.exact_name_court_pacer_id
+
+    - id: exact_normalized_name_same_court
+      description: >
+        Identical normalized name + same court, ≥2 tokens.
+        Single-token / USA-style collapses go through barrier + Tier3.
+        Placeholders (John Doe) never join across cases via this key.
+      type: conjunction
+      fields: [normalized_name, court]
+      min_name_tokens: 2
+      match:
+        forbid_office_class: [placeholder]
+      confidence: 95
+      method: tier0.exact_name_court
+
+    - id: exact_corp_core_same_court
+      description: >
+        Same corporate core key + court (suffix-stripped, hyphen→space).
+        Additive to exact_name_court; corporate office_class only.
+      type: conjunction
+      fields: [corp_core, court]
+      min_corp_core_tokens: 1
+      match:
+        require:
+          - office_class_equals_corporate
+      confidence: 95
+      method: tier0.exact_corp_core_court
+
+tier1:
+  enabled: true
+  compound_surnames: []
+  strategies:
+    - id: court_corp_core
+      key_template: "{court}|{corp_core}"
+      require_office_class: corporate
+      fields:
+        court: court
+        corp_core: corp_core_from_normalized_name
+    - id: court_first_two_tokens
+      key_template: "{court}|{first_two_tokens}"
+      fields:
+        court: court
+        first_two_tokens: first_two_tokens
+    - id: court_surname
+      key_template: "{court}|{surname}"
+      fields:
+        court: court
+        surname: surname_from_normalized_name
+    - id: court_initials
+      key_template: "{court}|{initials}"
+      fields:
+        court: court
+        initials: first_last_initials
+    - id: court_surname_year
+      key_template: "{court}|{surname}|{year}"
+      optional: true
+      fields:
+        court: court
+        surname: surname_from_normalized_name
+        year: year
+  residual_bucket: "_UNBLOCKED_"
+
+tier2:
+  enabled: true
+  backend: ollama_faiss
+  ollama_embed_model: "nomic-embed-text"
+  model: "nomic-embed-text"
+  fallback_model: "rapidfuzz"
+  index:
+    backend: faiss
+    metric: ip
+    path: "data/embeddings/parties/faiss.index"
+    id_map_path: "data/embeddings/parties/id_map.jsonl"
+  search:
+    top_k: 25
+    min_similarity: 0.72
+    auto_merge_min: 0.92
+    ambiguous_low: 0.72
+    ambiguous_high: 0.92
+  # Parties: embedding similarity alone is never enough for Tier2 auto-merge
+  # (same principle as firms Class-5 corroboration_required, applied to all pairs).
+  auto_merge_requires_corroboration:
+    enabled: true
+    accept_shared_pacer_id: true
+    accept_shared_contact: true
+    accept_compatible_name_core: true
+    min_core_ratio: 88             # fuzz.ratio threshold for spelling-variant match
+    min_core_bilateral_coverage: 0.80  # each side must cover ≥80% of the other's
+                                       # distinctive tokens (replaces one-sided
+                                       # token_set_ratio + token_prefix checks)
+  marginal_recall:
+    enabled: false
+
+information_content_barrier:
+  enabled: true
+  triggers:
+    - id: single_token_name
+      rule: "token_count(normalized_name) == 1"
+    - id: initial_heavy
+      rule: "initial_token_ratio >= 0.5"
+    - id: bare_initials_person
+      rule: "all_tokens_are_initials"
+      office_classes: [nominal_person, private_other, placeholder]
+    - id: very_common_surname
+      rule: "surname in common_surnames_list"
+      list_path: "data/external/common_surnames.txt"
+  on_trigger:
+    allow_tier0: true
+    allow_tier2_auto_merge: false
+    allow_tier2_candidate: true
+    auto_send_to_llm: false
+
+tier3:
+  enabled: true
+  backend: ollama
+  model: "qwen2.5:7b"
+  endpoint: "http://localhost:11434"
+  progress_log_every: 25
+  temperature: 0.0
+  prompt_path: "prompts/tier3_adjudicate_parties.txt"
+  json_schema_path: "prompts/tier3_output_parties.schema.json"
+  decision_cache:
+    enabled: true
+    path: "data/decisions/parties_tier3_cache.jsonl"
+    key: "normalized_pair_signature"
+  routing:
+    require_same_block: true
+    require_similarity_in:
+      low: 0.72
+      high: 0.92
+    skip_if_barrier_and_no_supporting_evidence: true
+    # Cross-UCID Tier0 alias_group pairs skip LLM (USA / United States / …).
+    skip_alias_groups_cross_ucid:
+      - united_states_government
+  budget:
+    target_mention_fraction_min: 0.05
+    target_mention_fraction_max: 0.15
+  abstain_confidence_below: 60
+  barrier_llm_min_confidence: 80
+  # Shared UCID/court/year is co-litigant context, not identity. Barrier
+  # pairs whose only extra signal is the same case need near-certainty.
+  ucid_weak_context: true
+  ucid_only_corroboration_barrier_min_confidence: 99
+  ucid_only_match_requires_name_overlap: true
+  ucid_only_match_requires_same_corp_core: true
+  # Step 1 — citation verification (foundational). Failed claims → UNCERTAIN.
+  citation_verification:
+    enabled: true
+    require_cited_evidence: true
+    on_failed_citation: UNCERTAIN
+  # Step 2 — asymmetric MATCH bar: MATCH needs ≥1 verified discriminating fact.
+  match_requires_discriminating_fact:
+    enabled: true
+    require_cited: true
+    facts:
+      - same_pacer_id
+      - same_domain
+      - same_phone
+      - same_address
+      - shared_fjc_nid
+      - identical_name_ge2_same_court
+  max_error_rate: 0.02
+  max_consecutive_errors: 5
+  evidence:
+    # MDL dockets can share 400+ co-defendant names; cap prompt bloat.
+    co_mentions_overlap_max: 25
+
+tier4:
+  enabled: false
+  triggers: []
+  sources: []
+  writeback: temporally_scoped_alias_triples
+
+clustering:
+  algorithm: union_find
+  verify_merges: true
+  # After name-gate splits, join entities whose names differ only by
+  # hyphen/slash/period/spacing. Exact same-name cross-court splits with no
+  # punct difference are left alone (see PARTIES_KNOWN_LIMITATIONS §5).
+  union_punct_fold_variants: true
+  split_fund_plan_types: true
+  split_generational_suffixes: true
+  large_cluster_verify_min_size: 8
+  reject_if: []
+  sentinel_labels: [Ambiguous, Inconclusive]
+  id_prefix: "SP"
+
+provenance:
+  decisions_path: "data/decisions/parties_decisions.jsonl"
+  required_fields:
+    - decision_id
+    - mention_id_a
+    - mention_id_b
+    - entity_type
+    - decision
+    - confidence
+    - method
+    - rationale
+    - evidence
+    - timestamp
+    - config_version
+
+rdf:
+  ontology_ref: "data/external/scales_pacer_ontology.ttl"
+  base: "http://scales-kg.org/pacer#"
+  id_base: "http://scales-kg.org/id/"
+  graph_uri: "http://scales-kg.org/graph/tier_v3_parties"
+  entity_class: Party
+  entity_id_kind: party
+  mention_class: PartyMention
+  id_predicate: hasSPID
+  alias_id_kind: party_alias
+  resolution_id_kind: party_resolution
+  mention_id_kind: party_mention
+  content_hash_uris: true
+  use_existing:
+    classes: [Case, Court]
+    predicates: [hasName, hasUcid, hasCode]
+  extensions_pending_review:
+    classes: [Party, PartyMention, ResolutionDecision, NameAssertion]
+    predicates: [hasSPID, assertsNameFor, hasPartyRole]
+  store:
+    dev_backend: oxigraph
+    prod_backend: tentris
+    tentris_sparql: "http://localhost:9080/sparql"
+    tentris_update: "http://localhost:9080/update"
+
+evaluation:
+  gold:
+    jel_path: null
+    sel_path: null
+  metrics:
+    - llm_mention_fraction
+    - stratified_human_audit
+
+incremental:
+  enabled: true
+  registry_path: "data/runs/parties_pilot/clusters/parties_entity_registry.jsonl"
+  mode_after_bulk: match_against_registry
