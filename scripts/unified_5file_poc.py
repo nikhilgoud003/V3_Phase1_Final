@@ -589,7 +589,13 @@ def main() -> int:
         "--files",
         nargs="*",
         default=None,
-        help="Optional ordered list of filenames (default: the Part-B Bard 5-file set)",
+        help="Optional ordered list of filenames under --json-dir "
+        "(default: all *.json in the directory, sorted)",
+    )
+    ap.add_argument(
+        "--poc-bard5",
+        action="store_true",
+        help="Use the original Part-B Bard 5-file subset only (ignores other JSONs)",
     )
     ap.add_argument(
         "--output-dir",
@@ -612,25 +618,29 @@ def main() -> int:
         out_root = ROOT / out_root
     out_root.mkdir(parents=True, exist_ok=True)
 
-    if args.files:
+    if args.files is not None:
         names = list(args.files)
-    else:
-        names = list(POC_FILES)
-    files = [json_root / name for name in names]
-    missing = [str(fp) for fp in files if not fp.is_file()]
-    if missing:
-        if args.files is None and not any((json_root / n).is_file() for n in POC_FILES):
-            files = sorted(json_root.glob("*.json"))
-            if args.limit:
-                files = files[: args.limit]
-            if not files:
-                print(f"ERROR: no *.json in {json_root}", file=sys.stderr)
-                return 1
-        else:
+        files = [json_root / name for name in names]
+        missing = [str(fp) for fp in files if not fp.is_file()]
+        if missing:
             print("ERROR: missing files:\n  " + "\n  ".join(missing), file=sys.stderr)
             return 1
+    elif args.poc_bard5:
+        files = [json_root / name for name in POC_FILES]
+        missing = [str(fp) for fp in files if not fp.is_file()]
+        if missing:
+            print("ERROR: missing Bard-5 files:\n  " + "\n  ".join(missing), file=sys.stderr)
+            return 1
+    else:
+        # Default: every *.json in the folder (sorted). This is what you want for 10 or 1000.
+        files = sorted(json_root.glob("*.json"))
+        if not files:
+            print(f"ERROR: no *.json in {json_root}", file=sys.stderr)
+            return 1
+
     if args.limit is not None:
         files = files[: args.limit]
+    print(f"Will process {len(files)} JSON file(s) from {json_root}", flush=True)
     file_names = [fp.name for fp in files]
 
     cfgs: dict[str, dict] = {}

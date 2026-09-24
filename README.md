@@ -48,6 +48,7 @@ cp /path/to/your/*.json data/json/input/
 
 ```bash
 # Writes entities.jsonl, mentions.jsonl, decisions.jsonl, summary.json
+# Default: processes ALL *.json in --json-dir (sorted).
 export KMP_DUPLICATE_LIB_OK=TRUE
 export OMP_NUM_THREADS=1
 python3 scripts/unified_5file_poc.py \
@@ -57,7 +58,11 @@ python3 scripts/unified_5file_poc.py \
 
 **What it does:** Reads each JSON once, extracts judge/firm/party mentions, runs Tier0–3 cascade on the cumulative pool, writes one flat results folder under `data/runs/my_run/`.
 
-Optional: `--debug-steps` also writes per-file `step_XX_*` snapshots (off by default).
+Optional flags:
+- `--limit 50` — process only the first N files (after sort)
+- `--files a.json b.json` — explicit file list
+- `--poc-bard5` — original 5-file Bard subset only
+- `--debug-steps` — also write per-file `step_XX_*` snapshots (off by default)
 
 ---
 
