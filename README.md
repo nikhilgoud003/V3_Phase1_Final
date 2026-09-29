@@ -2,6 +2,8 @@
 
 Cold-start entity resolution (judges + firms + parties) on PACER JSON files, then RDF emit and load into a **test** Tentris store.
 
+Full design, file-by-file map, and JSON-to-Tentris walkthrough: **`TIER_V3_FINAL_REPORT.md`**.
+
 **Not included:** PACER input JSON files. Put your own under `data/json/`.
 
 ---
