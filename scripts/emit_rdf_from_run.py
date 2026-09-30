@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit Turtle RDF from a unified PoC run folder (entities/mentions/decisions.jsonl)."""
+"""Emit Turtle RDF from a unified run folder (entities/mentions/decisions.jsonl)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from engine.config_loader import load_config  # noqa: E402
-from engine.rdf_emit import emit_ttl  # noqa: E402
+from engine.config_loader import load_config
+from engine.rdf_emit import emit_ttl
 
 TYPE_CFG = {
     "judge": ROOT / "configs/judges.yaml",
@@ -28,16 +28,8 @@ def _etype(row: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Emit RDF TTL from unified run outputs")
-    ap.add_argument(
-        "--run-dir",
-        required=True,
-        help="Run folder with entities.jsonl, mentions.jsonl, decisions.jsonl",
-    )
-    ap.add_argument(
-        "--combined-name",
-        default="entities.ttl",
-        help="Combined TTL filename under <run-dir>/rdf/ (default: entities.ttl)",
-    )
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--combined-name", default="entities.ttl")
     args = ap.parse_args()
 
     run = Path(args.run_dir)
@@ -50,7 +42,6 @@ def main() -> int:
 
     rdf_dir = run / "rdf"
     rdf_dir.mkdir(parents=True, exist_ok=True)
-
     entities = [json.loads(l) for l in (run / "entities.jsonl").open(encoding="utf-8") if l.strip()]
     mentions = [json.loads(l) for l in (run / "mentions.jsonl").open(encoding="utf-8") if l.strip()]
     decisions = [json.loads(l) for l in (run / "decisions.jsonl").open(encoding="utf-8") if l.strip()]
@@ -64,7 +55,7 @@ def main() -> int:
         decs = [
             d
             for d in decisions
-            if (_etype(d) == t)
+            if _etype(d) == t
             or (
                 not _etype(d)
                 and (d.get("mention_id_a") in mid_set or d.get("mention_id_b") in mid_set)
@@ -74,8 +65,7 @@ def main() -> int:
         with dec_path.open("w", encoding="utf-8") as f:
             for d in decs:
                 f.write(json.dumps(d, ensure_ascii=False) + "\n")
-        out = rdf_dir / OUT_NAME[t]
-        ttl = emit_ttl(ents, mens, dec_path, cfg, out_path=str(out))
+        ttl = emit_ttl(ents, mens, dec_path, cfg, out_path=str(rdf_dir / OUT_NAME[t]))
         print(f"{t}: entities={len(ents)} mentions={len(mens)} decisions={len(decs)} -> {ttl}")
         paths.append(ttl)
 
@@ -86,9 +76,7 @@ def main() -> int:
         if i > 0:
             kept = []
             for line in text.splitlines():
-                if line.startswith("@prefix ") or line.startswith("# Graph:") or line.startswith(
-                    "# Entity class:"
-                ) or line.startswith("# SKOS"):
+                if line.startswith("@prefix ") or line.startswith("# "):
                     continue
                 kept.append(line)
             text = "\n".join(kept).lstrip("\n")

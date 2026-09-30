@@ -707,7 +707,13 @@ def main() -> int:
     ap.add_argument(
         "--cold-start",
         action="store_true",
-        help="Ignore prior entities; remint SJIDs from zero (default is resume when possible)",
+        help="Does not wipe a checkpoint. If checkpoint/state.json exists, the run resumes. "
+        "Use --fresh to start over.",
+    )
+    ap.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start from file 1. Refuses if --output-dir already contains any file.",
     )
     args = ap.parse_args()
 
@@ -717,6 +723,17 @@ def main() -> int:
     out_root = Path(args.output_dir)
     if not out_root.is_absolute():
         out_root = ROOT / out_root
+    if args.fresh:
+        existing = []
+        if out_root.exists():
+            existing = [p for p in out_root.rglob("*") if p.is_file()]
+        if existing:
+            print(
+                f"ERROR: --fresh refused; output dir is not empty ({len(existing)} files in {out_root}). "
+                "Pick an empty directory.",
+                file=sys.stderr,
+            )
+            return 1
     out_root.mkdir(parents=True, exist_ok=True)
 
     if args.files is not None:
@@ -749,8 +766,9 @@ def main() -> int:
         cfg = load_config(cpath)
         cfgs[cfg.get("entity_type") or etype] = cfg
 
-    raw: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
-    transfers: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import incremental_resolve as inc  # noqa: E402
+
     discovery_log: list[dict] = []
     step_summaries: list[dict] = []
     mdl_by_ucid: dict[str, Any] = {}
@@ -764,32 +782,65 @@ def main() -> int:
     t_start = time.time()
     n_files = len(files)
 
+    # A checkpoint wins over --cold-start. Only --fresh (and an empty dir) starts over.
+    state = inc.load_checkpoint(out_root)
+    if state is None:
+        state = {
+            "processed": [],
+            "next_serial": {"judge": -1, "firm": -1, "party": -1},
+            "timings": [],
+            "entities": {"judge": [], "firm": [], "party": []},
+            "mentions": {"judge": [], "firm": [], "party": []},
+            "decisions": [],
+            "poc_evidence": [],
+            "cascade_last": {},
+        }
+    embed_cache = inc.EmbedCache(out_root / "checkpoint" / "embed_cache.json")
+    state["embed_cache"] = embed_cache
+    processed_keys = {(p["file"], p["sha256"]) for p in state["processed"]}
+    prefixes = {
+        et: (cfgs[et].get("clustering") or {}).get("id_prefix", "SJ")
+        for et in ("judge", "firm", "party")
+    }
+    link_journal = DecisionJournal(out_root / "checkpoint" / "link_decisions.jsonl", fresh=not processed_keys)
+
     final_entities: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
     final_mentions: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
     final_by_id: dict[str, dict] = {}
     final_cascade: dict[str, Any] = {}
 
+
+    resume_at = None
+    if state["processed"]:
+        for step_i, fp in enumerate(files, start=1):
+            if (fp.name, inc.file_sha256(fp)) not in processed_keys:
+                resume_at = step_i
+                break
+        if resume_at is not None:
+            note = " (--cold-start ignored because checkpoint/state.json exists)" if args.cold_start else ""
+            print(f"RESUMING from file {resume_at}{note}", flush=True)
+        else:
+            print(f"RESUMING from file {len(files)+1} (all {len(files)} files already in checkpoint)", flush=True)
+
     try:
         for step_i, fp in enumerate(files, start=1):
-            step_dir: Path | None = None
-            if args.debug_steps:
-                step_dir = out_root / f"step_{step_i:02d}_{fp.stem}"
-                step_dir.mkdir(parents=True, exist_ok=True)
+            digest = inc.file_sha256(fp)
+            if (fp.name, digest) in processed_keys:
+                print(f"SKIP already processed step-file {fp.name} sha256={digest[:12]}", flush=True)
+                continue
+            t_file = time.perf_counter()
+            t_read = time.perf_counter()
+            with open(fp, encoding="utf-8") as f:
+                case = json.load(f)
+            sec_read = time.perf_counter() - t_read
 
             print("\n" + "=" * 72)
             print(f"STEP {step_i}/{n_files}  file={fp.name}")
             print("=" * 72, flush=True)
 
-            with open(fp, encoding="utf-8") as f:
-                case = json.load(f)
-
-            ucid = case.get("ucid") or ""
-            mdl_val = case.get("mdl_code")
-            if mdl_val in (None, False, ""):
-                mdl_val = None
-            mdl_by_ucid[ucid] = mdl_val
-
             file_mentions: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
+            file_xfers: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
+            t_extract = time.perf_counter()
             for etype, cfg in cfgs.items():
                 case_i = copy.deepcopy(case)
                 mentions, xfers = extract_from_case(case_i, cfg, source_file=fp.name)
@@ -797,226 +848,126 @@ def main() -> int:
                     t["ucid"] = case.get("ucid")
                     t["source_file"] = fp.name
                 file_mentions[etype] = mentions
-                raw[etype].extend(mentions)
-                transfers[etype].extend(xfers)
-
+                file_xfers[etype] = xfers
             discovered, dlog = discover_unknown_mentions(case, fp.name, cfgs, field_cache)
             discovery_log.extend(dlog)
             for etype, ms in discovered.items():
                 file_mentions[etype].extend(ms)
-                raw[etype].extend(ms)
-
             attach_party_case_context(
                 file_mentions["party"],
                 file_mentions["judge"],
                 file_mentions["firm"],
                 case,
             )
+            sec_extract = time.perf_counter() - t_extract
 
-            if step_dir is not None:
-                write_jsonl(step_dir / "file_mentions_judge.jsonl", file_mentions["judge"])
-                write_jsonl(step_dir / "file_mentions_firm.jsonl", file_mentions["firm"])
-                write_jsonl(step_dir / "file_mentions_party.jsonl", file_mentions["party"])
-
-            # Cascade writes under work_dir (single scratch; last step = final)
             if work_dir.exists():
                 shutil.rmtree(work_dir)
             work_dir.mkdir(parents=True, exist_ok=True)
-            os.environ["TIER_V3_OUTPUT_DIR"] = str(work_dir)
 
-            step_entities: dict[str, list[dict]] = {}
-            step_by_id: dict[str, dict[str, dict]] = {}
             step_cascade: dict[str, dict] = {}
-
+            t_resolve = time.perf_counter()
+            # Within-file cascade only. Old mentions stay in the registry.
             for etype, cfg_path in DEFAULT_TYPE_CONFIGS.items():
-                cfg = load_config(cfg_path)
                 print(
-                    f"\n--- finalize+cascade entity_type={etype} n_raw={len(raw[etype])} ---",
+                    f"\n--- incremental entity_type={etype} n_new={len(file_mentions[etype])} "
+                    f"n_saved_entities={len(state['entities'][etype])} ---",
                     flush=True,
                 )
-                finalized = _finalize_mentions(
-                    cfg,
-                    list(raw[etype]),
-                    list(transfers[etype]),
-                    write=True,
-                    transfer_out_rel=f"data/mentions/transfer_clues_{etype}.jsonl",
+                resolved = inc.resolve_within_file(
+                    file_mentions[etype], file_xfers[etype], cfgs[etype], work_dir
                 )
-                if etype == "party":
-                    by_ucid_j: dict[str, list[dict]] = defaultdict(list)
-                    by_ucid_f: dict[str, list[dict]] = defaultdict(list)
-                    for m in raw["judge"]:
-                        by_ucid_j[m.get("ucid") or ""].append(m)
-                    for m in raw["firm"]:
-                        by_ucid_f[m.get("ucid") or ""].append(m)
-                    for m in finalized:
-                        u = m.get("ucid") or ""
-                        m["poc_case_judges"] = sorted(
-                            {
-                                x.get("normalized_name")
-                                for x in by_ucid_j.get(u, [])
-                                if x.get("normalized_name")
-                            }
-                        )
-                        m["poc_case_firms"] = sorted(
-                            {
-                                x.get("normalized_name")
-                                for x in by_ucid_f.get(u, [])
-                                if x.get("normalized_name")
-                            }
-                        )
-                        m["poc_mdl_code"] = mdl_by_ucid.get(u)
-                        m["poc_is_mdl"] = bool(mdl_by_ucid.get(u))
-
-                result = run_cascade(finalized, cfg, enable_tier3=True)
-                uf = result["uf"]
-                by_id = result["by_id"]
-                poc_info: dict[str, Any] = {}
-
-                if etype == "party":
-                    journal = DecisionJournal(
-                        resolve_path(cfg, "data/decisions/poc_party_evidence_decisions.jsonl"),
-                        fresh=True,
-                    )
-                    poc_stats = adjudicate_poc_evidence_via_tier3(
-                        finalized, uf, cfg, journal=journal, max_pairs=25
-                    )
-                    print(
-                        f"PoC party evidence: candidates={poc_stats['candidates']} "
-                        f"tier3_calls={poc_stats['tier3_calls']} "
-                        f"merges_after_citation_MATCH={poc_stats['merges']}",
-                        flush=True,
-                    )
-                    if poc_stats["merges"]:
-                        comps = rebuild_components(uf, [m["mention_id"] for m in finalized])
-                        entities = cluster_mentions(comps, by_id, cfg, uf)
-                    else:
-                        entities = cluster_mentions(result["components"], by_id, cfg, uf)
-                    poc_info = {
-                        "candidates": poc_stats["candidates"],
-                        "tier3_calls": poc_stats["tier3_calls"],
-                        "merges_after_citation_match": poc_stats["merges"],
-                        "rows": poc_stats["rows"],
-                    }
-                    if step_dir is not None:
-                        write_jsonl(
-                            step_dir / "poc_party_tier3_adjudications.jsonl",
-                            poc_stats["rows"],
-                        )
-                    poc_evidence_all.append({"step": step_i, "file": fp.name, **poc_info})
-                else:
-                    entities = cluster_mentions(result["components"], by_id, cfg, uf)
-
-                step_entities[etype] = entities
-                step_by_id[etype] = by_id
+                cfg = load_config(cfg_path)
+                journal = link_journal
+                saved, fresh, link_stats = inc.link_against_saved(
+                    resolved["entities"],
+                    resolved["by_id"],
+                    state["entities"][etype],
+                    cfg,
+                    embed_cache,
+                    journal,
+                )
+                fresh, state["next_serial"][etype] = inc.stamp_new_entities(
+                    fresh, resolved["by_id"], prefixes[etype], state["next_serial"][etype]
+                )
+                state["entities"][etype] = saved + fresh
+                state["mentions"][etype].extend(resolved["mentions"])
+                state["decisions"].extend(resolved["decisions"])
                 step_cascade[etype] = {
-                    "summary": result.get("summary"),
-                    "n_mentions": len(finalized),
-                    "n_entities": len(entities),
-                    "poc_party_evidence": poc_info or None,
+                    "summary": resolved.get("summary"),
+                    "n_mentions_new": len(resolved["mentions"]),
+                    "n_entities_total": len(state["entities"][etype]),
+                    "link": link_stats,
+                    "poc_party_evidence": resolved.get("poc") or None,
                 }
+                if resolved.get("poc"):
+                    poc_evidence_all.append({"step": step_i, "file": fp.name, **resolved["poc"]})
+            sec_resolve = time.perf_counter() - t_resolve
 
-            # Remember latest cumulative state for final bundle
-            final_entities = step_entities
-            final_mentions = {
-                etype: list(step_by_id[etype].values()) for etype in ("judge", "firm", "party")
+            t_write = time.perf_counter()
+            elapsed_file = time.perf_counter() - t_file
+            timing = {
+                "step": step_i,
+                "file": fp.name,
+                "sha256": digest,
+                "sec_total": round(elapsed_file, 3),
+                "sec_read": round(sec_read, 3),
+                "sec_extract": round(sec_extract, 3),
+                "sec_resolve": round(sec_resolve, 3),
+                "sec_write": 0.0,
             }
-            final_by_id = {}
-            for etype in ("judge", "firm", "party"):
-                final_by_id.update(step_by_id[etype])
+            state["processed"].append({"file": fp.name, "sha256": digest, "step": step_i, "sec": timing["sec_total"]})
+            processed_keys.add((fp.name, digest))
+            state["timings"].append(timing)
+            state["cascade_last"] = step_cascade
+            final_entities = state["entities"]
+            final_mentions = state["mentions"]
             final_cascade = step_cascade
-
-            cross = {
-                etype: entity_cross_file_report(step_entities[etype], step_by_id[etype])
-                for etype in ("judge", "firm", "party")
-            }
-            summary_step = {
+            step_summaries.append({
                 "step": step_i,
                 "file": fp.name,
                 "ucid": case.get("ucid"),
                 "case_name": case.get("case_name"),
-                "files_in_pool": file_names[:step_i],
                 "counts": {
                     etype: {
                         "file_mentions": len(file_mentions[etype]),
-                        "cumulative_raw": len(raw[etype]),
-                        "cumulative_entities": len(step_entities[etype]),
-                        "cross_file_entities": len(cross[etype]),
+                        "cumulative_entities": len(state["entities"][etype]),
+                        "cumulative_mentions": len(state["mentions"][etype]),
                     }
                     for etype in ("judge", "firm", "party")
                 },
-                "cascade": {
-                    etype: {
-                        "n_mentions": step_cascade[etype]["n_mentions"],
-                        "n_entities": step_cascade[etype]["n_entities"],
-                        "summary": step_cascade[etype].get("summary"),
-                    }
-                    for etype in ("judge", "firm", "party")
-                },
-                "poc_party_evidence": (poc_evidence_all[-1] if poc_evidence_all else None),
+                "link": {etype: step_cascade[etype]["link"] for etype in ("judge", "firm", "party")},
+                "timing": timing,
+            })
+            state["summary_partial"] = {
+                "output_dir": str(out_root),
+                "incremental": True,
+                "processed_files": len(state["processed"]),
+                "timings": state["timings"],
             }
-            step_summaries.append(summary_step)
-            print(json.dumps(summary_step["counts"], indent=2), flush=True)
+            inc.save_checkpoint(out_root, state)
+            timing["sec_write"] = round(time.perf_counter() - t_write, 3)
+            print(
+                f"FILE_SEC step={step_i} file={fp.name} sec={timing['sec_total']:.3f} "
+                f"read={timing['sec_read']:.3f} extract={timing['sec_extract']:.3f} "
+                f"resolve={timing['sec_resolve']:.3f}",
+                flush=True,
+            )
+            print(f"CHECKPOINT file_done={step_i} name={fp.name}", flush=True)
 
-            if step_dir is not None:
-                write_jsonl(step_dir / "cross_file_entities_judge.jsonl", cross["judge"])
-                write_jsonl(step_dir / "cross_file_entities_firm.jsonl", cross["firm"])
-                write_jsonl(step_dir / "cross_file_entities_party.jsonl", cross["party"])
-                (step_dir / "step_summary.json").write_text(
-                    json.dumps(summary_step, indent=2, default=str), encoding="utf-8"
-                )
-                # Copy cascade scratch into step folder for inspection
-                for sub in ("mentions", "clusters", "decisions"):
-                    src = work_dir / sub
-                    if src.is_dir():
-                        dst = step_dir / sub
-                        if dst.exists():
-                            shutil.rmtree(dst)
-                        shutil.copytree(src, dst)
-
-        # --- Final single-folder outputs ---
-        # Stable SJIDs: resume from prior entities unless --cold-start
-        alias_to_gid = _alias_name_to_group(cfgs)
-        prefixes = {
-            "judge": (cfgs["judge"].get("clustering") or {}).get("id_prefix", "SJ"),
-            "firm": (cfgs["firm"].get("clustering") or {}).get("id_prefix", "SF"),
-            "party": (cfgs["party"].get("clustering") or {}).get("id_prefix", "SP"),
+        final_entities = state["entities"]
+        final_mentions = state["mentions"]
+        final_by_id = {}
+        for etype in ("judge", "firm", "party"):
+            for m in final_mentions[etype]:
+                final_by_id[m["mention_id"]] = m
+        id_report = {
+            "cold_start": not bool(processed_keys),
+            "incremental": True,
+            "mode": "match_new_file_against_saved_registry",
         }
-        prior_path: Path | None = None
-        if not args.cold_start:
-            if args.resume_from:
-                rp = Path(args.resume_from)
-                if not rp.is_absolute():
-                    rp = ROOT / rp
-                prior_path = rp if rp.is_file() else rp / "entities.jsonl"
-            else:
-                cand = out_root / "entities.jsonl"
-                if cand.is_file():
-                    prior_path = cand
-        prior_ents = load_prior_entities(prior_path) if prior_path else []
-        id_report: dict[str, Any] = {"cold_start": True, "prior_path": None}
-        if prior_ents:
-            final_entities, id_report = remap_entity_ids(
-                final_entities, prior_ents, alias_to_gid, prefixes
-            )
-            id_report["cold_start"] = False
-            id_report["prior_path"] = str(prior_path)
-            print(
-                f"ID remap: reuse={id_report['n_reuse']} create={id_report['n_create']} "
-                f"from {prior_path}",
-                flush=True,
-            )
-        else:
-            # Still normalize prefixes/type fields for a deterministic first run
-            final_entities, id_report = remap_entity_ids(
-                final_entities, [], alias_to_gid, prefixes
-            )
-            id_report["cold_start"] = True
-            print(
-                f"ID assign (cold): create={id_report['n_create']}",
-                flush=True,
-            )
 
-        decisions = _collect_decision_rows(work_dir, final_by_id)
+        decisions = list(state['decisions'])
         cross_final = {
             etype: entity_cross_file_report(final_entities[etype], {m["mention_id"]: m for m in final_mentions[etype]})
             for etype in ("judge", "firm", "party")
@@ -1059,6 +1010,12 @@ def main() -> int:
                 "summary": "summary.json",
             },
         }
+        final_entities = {
+            et: [{k: v for k, v in e.items() if k != "_proto"} for e in state["entities"][et]]
+            for et in ("judge", "firm", "party")
+        }
+        final_mentions = state["mentions"]
+        decisions = list(state["decisions"])
         write_final_bundle(
             out_root,
             entities_by_type=final_entities,

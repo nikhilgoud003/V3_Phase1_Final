@@ -16,16 +16,24 @@ venv/
 *.pem
 credentials.json
 
-# Input PACER dockets (place locally; do not commit)
-data/json/**
+# Local data except the four reference files and two placeholders
+data/*
+!data/external/
+!data/judges_fjc.csv
+!data/json/
+!data/runs/
+data/external/*
+!data/external/common_surnames.txt
+!data/external/firms_biglaw_cores.txt
+!data/external/fjc_court_crosswalk.json
+data/json/*
 !data/json/.gitkeep
-
-# Run outputs (generated locally)
-data/runs/**
+data/runs/*
 !data/runs/.gitkeep
 
-# Local Tentris datastores
-data/tentris_*/
+# Tentris datastores and binaries
+tentris
+tentris-*
 *.ttl.bak
 
 # Tentris debug

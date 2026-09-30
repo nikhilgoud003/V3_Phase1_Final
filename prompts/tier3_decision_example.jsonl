@@ -1,0 +1,25 @@
+# Example Tier-3 decision journal line (written by engine/provenance.py)
+# One JSON object per line in data/decisions/decisions.jsonl
+
+{
+  "decision_id": "dec_00000001",
+  "mention_id_a": "mnt_...",
+  "mention_id_b": "mnt_...",
+  "entity_type": "judge",
+  "decision": "MATCH",
+  "confidence": 87,
+  "method": "tier3.ollama.qwen2.5:7b",
+  "rationale": "Same surname+given name in same court; middle initial compatible; no transfer conflict.",
+  "signals": ["same_court", "middle_initial"],
+  "evidence": {
+    "block_key": "almd|smith",
+    "embedding_similarity": 0.81,
+    "transfer_conflict": false,
+    "fjc_nid_a": null,
+    "fjc_nid_b": null,
+    "information_content_barrier": false
+  },
+  "cache_key": "almd|john a smith||john smith|assigned",
+  "timestamp": "2026-08-03T20:00:00Z",
+  "config_version": "0.1.0"
+}

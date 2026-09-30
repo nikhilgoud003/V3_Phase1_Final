@@ -1,131 +1,35 @@
-# V3 Phase 1 — unified ER → RDF → Tentris
+# Tier_V3 — SCALES / OKN PACER entity resolution
 
-Cold-start entity resolution (judges + firms + parties) on PACER JSON files, then RDF emit and load into a **test** Tentris store.
+**Final product doc:** [`docs/FINAL_V3.md`](docs/FINAL_V3.md)  
+**One command — all ER (judges+firms+parties):** [`docs/RUN_NEW_JSONS.md`](docs/RUN_NEW_JSONS.md)  
+**File / folder map (judges · firms · parties):** [`FINAL_FILES/README.md`](FINAL_FILES/README.md)
 
-Full design, file-by-file map, and JSON-to-Tentris walkthrough: **`TIER_V3_FINAL_REPORT.md`**.
+Scrap, duplicates, and superseded proofs live in  
+[`data/reports/archive/20260921_v3_cleanup/`](data/reports/archive/20260921_v3_cleanup/README.md).
 
-**Not included:** PACER input JSON files. Put your own under `data/json/`.
+## Entity types
 
----
+| | Config | Current run |
+|--|--------|-------------|
+| Judges | `configs/judges.yaml` | `data/runs/judges_pilot_recall_fix/` |
+| Firms | `configs/firms.yaml` | `data/runs/firms_pilot/` |
+| Parties | `configs/parties.yaml` | `data/runs/parties_pilot/` |
 
-## 0. One-time setup
+**Parties USA fix:** same-UCID alias merge for USA / United States / U.S.; cross-UCID pairs never go to Tier3. Details in `docs/FINAL_V3.md`.
+
+## Quick start (one upload → full ER)
+
+Put PACER `*.json` in a folder, then **one** command runs judges + firms + parties:
 
 ```bash
-git clone https://github.com/nikhilgoud003/V3_Phase1_Final.git
-cd V3_Phase1_Final
-```
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-python3 -m spacy download en_core_web_sm
+python -m spacy download en_core_web_sm
+# Ollama: qwen2.5:7b + nomic-embed-text
+
+python3 scripts/run_all_er.py \
+  --json-dir data/json/nyed_connectivity_test \
+  --load-tentris-clone
 ```
 
-```bash
-# Ollama (Tier2 embeddings + Tier3 LLM). Install from https://ollama.com then:
-ollama pull nomic-embed-text
-ollama pull qwen2.5:7b
-```
-
-```bash
-# Tentris v1.1.0 binary on PATH (example location). Used only for test KG load/serve.
-export PATH="$HOME/.local/bin:$PATH"
-tentris --help
-```
-
----
-
-## 1. Place input JSON
-
-```bash
-# Copy your PACER *.json dockets here (not committed to git)
-mkdir -p data/json/input
-cp /path/to/your/*.json data/json/input/
-```
-
----
-
-## 2. Run entity resolution (start → results)
-
-```bash
-# Writes entities.jsonl, mentions.jsonl, decisions.jsonl, summary.json
-# Default: processes ALL *.json in --json-dir (sorted).
-export KMP_DUPLICATE_LIB_OK=TRUE
-export OMP_NUM_THREADS=1
-python3 scripts/unified_5file_poc.py \
-  --json-dir data/json/input \
-  --output-dir data/runs/my_run
-```
-
-**What it does:** Reads each JSON once, extracts judge/firm/party mentions, runs Tier0–3 cascade on the cumulative pool, writes one flat results folder under `data/runs/my_run/`.
-
-Optional flags:
-- `--limit 50` — process only the first N files (after sort)
-- `--files a.json b.json` — explicit file list
-- `--poc-bard5` — original 5-file Bard subset only
-- `--resume-from data/runs/prior` — REUSE SJ/SF/SPIDs from a prior run
-- `--cold-start` — remint IDs from zero (default: auto-resume if `entities.jsonl` already exists in `--output-dir`)
-- `--debug-steps` — also write per-file `step_XX_*` snapshots (off by default)
-
-**IDs / USA:** Party abbreviations expand via `configs/parties.yaml` `expand_abbreviations` (not code hardcoding). Re-running into the same `--output-dir` reuses entity IDs when stable keys match.
-
-
----
-
-## 3. Emit RDF (.ttl)
-
-```bash
-python3 scripts/emit_rdf_from_run.py --run-dir data/runs/my_run
-```
-
-**What it does:** Runs the existing `emit_ttl` path for judges, firms, and parties; writes:
-
-- `data/runs/my_run/rdf/judges.ttl`
-- `data/runs/my_run/rdf/firms.ttl`
-- `data/runs/my_run/rdf/parties.ttl`
-- `data/runs/my_run/rdf/entities.ttl` (combined)
-
----
-
-## 4. Load into a new Tentris test store (not live)
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-
-# Brand-new empty store (separate from any live :9080 graph)
-rm -rf data/tentris_test_9082
-mkdir -p data/tentris_test_9082
-chmod 700 data/tentris_test_9082
-tentris --datastore-path data/tentris_test_9082 init
-chmod -R 700 data/tentris_test_9082
-
-# Load TTL (serve must be down for this path)
-tentris --datastore-path data/tentris_test_9082 load --format turtle data/runs/my_run/rdf/entities.ttl
-```
-
-**What it does:** Creates an empty Tentris database and loads your run’s Turtle. Does **not** touch any live datastore.
-
----
-
-## 5. Start Tentris (test port)
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-tentris --datastore-path data/tentris_test_9082 serve 127.0.0.1:9082
-```
-
-**What it does:** Serves SPARQL on port **9082** (use this so it cannot be confused with live `:9080`).
-
-- SPARQL: http://127.0.0.1:9082/sparql  
-- UI: http://127.0.0.1:9082/ui  
-
-Stop: `Ctrl+C`.
-
-Quick count check (another terminal):
-
-```bash
-curl -s -H 'Accept: application/sparql-results+json' \
-  --data-urlencode 'query=SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }' \
-  http://127.0.0.1:9082/sparql
-```
+Requires Ollama for Tier3. Tentris details: `docs/RUN_NEW_JSONS.md` / `docs/KG_INCREMENTAL_INSERT_RUNBOOK.md`.  
+(Advanced: still can call `scripts/run_pilot.py --config configs/<type>.yaml` per type.)
