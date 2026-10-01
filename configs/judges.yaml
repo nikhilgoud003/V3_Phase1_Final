@@ -233,6 +233,10 @@ name_validity:
     cache_path: "data/decisions/llm_name_validity_cache.jsonl"
     journal_path: "data/decisions/llm_name_validity_journal.jsonl"
     max_calls: 400
+    # Answers this check will need are fetched with this many parallel requests
+    # (decisions unchanged). Only faster when Ollama serves requests in parallel
+    # (OLLAMA_NUM_PARALLEL >= this value); with Ollama's default they queue.
+    parallel_requests: 4
 
 # -----------------------------------------------------------------------------
 # Mention profile serialization (Tier 2 embedding input — NOT bare names)

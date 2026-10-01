@@ -34,6 +34,7 @@ from engine.tiers import (
     load_common_surnames,
     party_slot,
     run_cascade,
+    save_llm_memo,
     tier0_merge_groups,
     tier3_adjudicate,
 )
@@ -181,6 +182,7 @@ def save_checkpoint(out_root: Path, state: dict[str, Any]) -> None:
     _atomic_write(ck / "decisions.jsonl", _rows_text(state["decisions"]))
     if state.get("embed_cache") is not None:
         state["embed_cache"].save()
+    save_llm_memo(ck / "llm_prompt_cache.jsonl")
     public_entities = []
     public_mentions = []
     for et in ("judge", "firm", "party"):

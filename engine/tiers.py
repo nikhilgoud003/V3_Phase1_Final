@@ -2396,6 +2396,39 @@ def load_output_schema(cfg: dict) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# Run-wide LLM answer cache keyed by model + the full prompt. The prompt holds
+# all the evidence the model sees (case, co-mentions, ...), so a cached answer
+# is the answer the same request returns (temperature 0). Callers still count
+# each call, so Tier3 budgets and every decision are unchanged.
+_LLM_MEMO: dict[str, dict] = {}
+LLM_MEMO_STATS = {"hits": 0, "misses": 0}
+
+
+def _llm_memo_key(model: str, prompt: str) -> str:
+    return hashlib.sha256(json.dumps([model, "json", prompt]).encode("utf-8")).hexdigest()
+
+
+def load_llm_memo(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    for line in path.open(encoding="utf-8"):
+        if line.strip():
+            rec = json.loads(line)
+            _LLM_MEMO[rec["key"]] = rec["response"]
+    return len(_LLM_MEMO)
+
+
+def save_llm_memo(path: Path) -> None:
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for k, v in _LLM_MEMO.items():
+            f.write(json.dumps({"key": k, "response": v}, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
 def call_ollama_json(
     model: str,
     prompt: str,
@@ -2403,6 +2436,26 @@ def call_ollama_json(
     *,
     retries: int = 5,
     retry_sleep_sec: float = 3.0,
+) -> dict:
+    import copy
+
+    key = _llm_memo_key(model, prompt)
+    if key in _LLM_MEMO:
+        LLM_MEMO_STATS["hits"] += 1
+        return copy.deepcopy(_LLM_MEMO[key])
+    LLM_MEMO_STATS["misses"] += 1
+    out = _call_ollama_json_uncached(model, prompt, endpoint, retries=retries, retry_sleep_sec=retry_sleep_sec)
+    _LLM_MEMO[key] = copy.deepcopy(out)
+    return out
+
+
+def _call_ollama_json_uncached(
+    model: str,
+    prompt: str,
+    endpoint: str,
+    *,
+    retries: int,
+    retry_sleep_sec: float,
 ) -> dict:
     import time
     import urllib.error

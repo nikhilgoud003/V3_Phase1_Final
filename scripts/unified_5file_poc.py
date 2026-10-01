@@ -19,7 +19,6 @@ By default, if --output-dir already has entities.jsonl, SJIDs are REUSED
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
@@ -45,15 +44,15 @@ from engine.extract import (  # noqa: E402
     DEFAULT_TYPE_CONFIGS,
     _emit_mention,
     _finalize_mentions,
-    extract_from_case,
 )
 from engine.normalize import normalize_name  # noqa: E402
+from engine.parallel_extract import iter_extracted  # noqa: E402
 from engine.poc_party_evidence import (  # noqa: E402
     adjudicate_poc_evidence_via_tier3,
     rebuild_components,
 )
 from engine.provenance import DecisionJournal  # noqa: E402
-from engine.tiers import run_cascade  # noqa: E402
+from engine.tiers import LLM_MEMO_STATS, load_llm_memo, run_cascade  # noqa: E402
 
 # Part B selection (fixed order)
 POC_FILES = [
@@ -718,6 +717,13 @@ def main() -> int:
         help="Override configs/unified.yaml schema_free_walk.enabled for this run.",
     )
     ap.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Processes for JSON reading + extraction (default: configs/unified.yaml "
+        "extract_workers; 0 = CPU count - 1; 1 = in-process).",
+    )
+    ap.add_argument(
         "--checkpoint-every",
         type=int,
         default=0,
@@ -784,6 +790,12 @@ def main() -> int:
     if args.schema_walk is not None:
         schema_walk = args.schema_walk == "on"
     print(f"Schema-free walk: {'on' if schema_walk else 'off'}", flush=True)
+    workers = args.workers if args.workers is not None else int(unified_cfg.get("extract_workers") or 0)
+    if workers <= 0:
+        workers = max(1, (os.cpu_count() or 2) - 1)
+    if schema_walk:
+        workers = 1  # the walk asks Qwen per field and shares a cache: keep it in-process
+    print(f"Extraction workers: {workers}", flush=True)
 
     sys.path.insert(0, str(ROOT / "scripts"))
     import incremental_resolve as inc  # noqa: E402
@@ -815,6 +827,9 @@ def main() -> int:
             "cascade_last": {},
         }
     inc.RUN_CACHE_DIR = out_root / "checkpoint"
+    n_memo = load_llm_memo(out_root / "checkpoint" / "llm_prompt_cache.jsonl")
+    if n_memo:
+        print(f"LLM prompt cache: {n_memo} answers loaded", flush=True)
     embed_cache = inc.EmbedCache(out_root / "checkpoint" / "embed_cache.json")
     state["embed_cache"] = embed_cache
     saved_index = {et: inc.SavedIndex() for et in ("judge", "firm", "party")}
@@ -845,33 +860,29 @@ def main() -> int:
         else:
             print(f"RESUMING from file {len(files)+1} (all {len(files)} files already in checkpoint)", flush=True)
 
+    digests = {fp: inc.file_sha256(fp) for fp in files}
+    todo = [fp for fp in files if (fp.name, digests[fp]) not in processed_keys]
+    extracted = iter_extracted(todo, {k: str(v) for k, v in DEFAULT_TYPE_CONFIGS.items()}, workers)
+
     try:
         for step_i, fp in enumerate(files, start=1):
-            digest = inc.file_sha256(fp)
+            digest = digests[fp]
             if (fp.name, digest) in processed_keys:
                 print(f"SKIP already processed step-file {fp.name} sha256={digest[:12]}", flush=True)
                 continue
             t_file = time.perf_counter()
-            t_read = time.perf_counter()
-            with open(fp, encoding="utf-8") as f:
-                case = json.load(f)
-            sec_read = time.perf_counter() - t_read
+            got = next(extracted)
+            assert got["file"] == fp.name, (got["file"], fp.name)
+            case = got["case"]
+            sec_read = got["sec_read"]
 
             print("\n" + "=" * 72)
             print(f"STEP {step_i}/{n_files}  file={fp.name}")
             print("=" * 72, flush=True)
 
-            file_mentions: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
-            file_xfers: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
-            t_extract = time.perf_counter()
-            for etype, cfg in cfgs.items():
-                case_i = copy.deepcopy(case)
-                mentions, xfers = extract_from_case(case_i, cfg, source_file=fp.name)
-                for t in xfers:
-                    t["ucid"] = case.get("ucid")
-                    t["source_file"] = fp.name
-                file_mentions[etype] = mentions
-                file_xfers[etype] = xfers
+            file_mentions: dict[str, list[dict]] = got["mentions"]
+            file_xfers: dict[str, list[dict]] = got["xfers"]
+            t_extract = time.perf_counter() - got["sec_extract"]
             if schema_walk:
                 discovered, dlog = discover_unknown_mentions(case, fp.name, cfgs, field_cache)
                 discovery_log.extend(dlog)
@@ -1029,6 +1040,7 @@ def main() -> int:
             },
             "cross_file_entities": cross_final,
             "embedding_calls": dict(EMBED_STATS),
+            "llm_prompt_cache": dict(LLM_MEMO_STATS),
             "per_file_cumulative": step_summaries,
             "cascade_final": final_cascade,
             "poc_party_evidence": poc_evidence_all,
