@@ -24,6 +24,8 @@ from typing import Any
 from .config_loader import resolve_path
 from .name_compat import names_compatible, punct_fold_compatible
 from .tiers import (
+    coparty_conflict,
+    party_slot,
     UnionFind,
     domain_is_non_identifying,
     fund_plan_type_tokens,
@@ -270,10 +272,25 @@ def _union_punct_fold_variants(
             i = parent[i]
         return i
 
+    # Same-case co-party barrier (config coparty_barrier): a punctuation join
+    # never puts two differently named, separately listed parties of one case
+    # into one entity.
+    slots: dict[int, set] = {}
+    if (cfg.get("coparty_barrier") or {}).get("enabled"):
+        for i, e in enumerate(entities):
+            slots[i] = {
+                s for s in (party_slot(by_id[mid], cfg) for mid in e.get("mention_ids") or [] if mid in by_id) if s
+            }
+
     def union(i: int, j: int) -> None:
         ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[rj] = ri
+        if ri == rj:
+            return
+        if slots and coparty_conflict(slots.get(ri, set()), slots.get(rj, set())):
+            return
+        parent[rj] = ri
+        if slots:
+            slots[ri] = slots.get(ri, set()) | slots.pop(rj, set())
 
     # Only compare entities that share a punct-folded core. Exact same-name
     # groups never get an edge unless a punctuation-different partner exists.
