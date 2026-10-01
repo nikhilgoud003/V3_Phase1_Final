@@ -177,6 +177,18 @@ normalization:
   strip_chars: ".,;:\"()[]{}"
   collapse_whitespace: true
   presentable_case: title             # for display name only
+  # General cleanup of docket prose glued to a name (engine/normalize.clean_name_span).
+  # No word lists: "Wu pending" / "Humetewa drawn" / "Tunheim per MDL" are cut at
+  # the first all-lowercase word after 2 words unless a capitalized name word
+  # follows ("Juan Carlos de la Garza" is kept); "Kendall:Motion" is cut at ":";
+  # "ROBRENOSentencing" is cut where 3+ capitals run into a capitalized word.
+  # Checked on all 4,074 FJC judges (12,508 name forms): 0 changed.
+  # The original string is kept on the mention as raw_name_uncleaned.
+  name_cleaning:
+    enabled: true
+    cut_at_chars: [":"]
+    split_glued_caps_min: 3
+    cut_lowercase_after_tokens: 2
   # Generational suffixes stay on the identity string (Jr/II/III) — do not strip.
 
 # -----------------------------------------------------------------------------

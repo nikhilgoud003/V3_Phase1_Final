@@ -212,6 +212,15 @@ def _emit_mention(
     if _is_drop_literal(raw, ext.get("drop_literals") or []):
         return None
 
+    # General docket-prose cleanup (config normalization.name_cleaning).
+    raw_uncleaned = None
+    if norm_cfg.get("name_cleaning"):
+        from engine.normalize import clean_name_span
+
+        cleaned = clean_name_span(raw, norm_cfg["name_cleaning"])
+        if cleaned != raw:
+            raw_uncleaned, raw = raw, cleaned
+
     loc_cfg = (norm_cfg.get("trailing_location") or {})
     name_for_norm = raw
     office_location = extra.get("office_location") if extra else None
@@ -339,6 +348,8 @@ def _emit_mention(
         rec["office_location"] = extra.get("office_location") or office_location
     if extra.get("party_type") is not None:
         rec["party_type"] = extra["party_type"]
+    if raw_uncleaned is not None:
+        rec["raw_name_uncleaned"] = raw_uncleaned
     return rec
 
 

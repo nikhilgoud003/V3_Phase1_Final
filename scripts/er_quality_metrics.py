@@ -30,10 +30,6 @@ ORG = re.compile(
     r'county|city|state|commission|board|office|university|hospital|agency|authority|district|usa|'
     r'united states|america|products|systems|technologies|foundation|society|church|school)\b'
 )
-JUDGE_JUNK_TAIL = {
-    'drawn', 'pending', 'per', 'mdl', 'motion', 'sentencing', 'hearing', 'trial', 'order', 're', 'plea',
-    'status', 'conference', 'entered', 'signed', 'granted', 'denied', 'filed', 'referred', 'reassigned',
-}
 GLUED = re.compile(r'[A-Z]{3,}[A-Z][a-z]{3,}')
 
 
@@ -103,12 +99,17 @@ def is_org(n: str) -> bool:
 
 
 def judge_name_junk(raw: str, normalized: str) -> bool:
-    toks = (normalized or '').split()
-    return bool(
-        (toks and toks[-1] in JUDGE_JUNK_TAIL)
-        or ':' in (raw or '')
-        or GLUED.search(raw or '')
+    """Docket prose left on a judge name: a trailing all-lowercase word in a
+    name that has capitals, a ':' or a glued all-caps+Capitalized word."""
+    raw = raw or ''
+    toks = raw.split()
+    tail_lower = (
+        len(toks) >= 3
+        and any(c.isupper() for c in raw)
+        and toks[-1].isalpha()
+        and toks[-1].islower()
     )
+    return bool(tail_lower or ':' in raw or GLUED.search(raw))
 
 
 def judge_metrics(rows, idf, name, court, fjc_of, idx, info):

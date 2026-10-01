@@ -247,6 +247,8 @@ class SavedIndex:
         self.n = 0
         self.by_block: dict[str, list[int]] = defaultdict(list)
         self.by_alias: dict[str, list[int]] = defaultdict(list)
+        self.by_nid: dict[str, set[int]] = defaultdict(set)
+        self.pos: dict[int, int] = {}
 
     def sync(self, saved: list[dict], cfg: dict) -> None:
         if self.n >= len(saved):
@@ -256,6 +258,9 @@ class SavedIndex:
         protos = [e.get("_proto") or {} for e in new]
         blocks = build_profile_blocks([p for p in protos if p.get("mention_id")], cfg)
         for i, (e, proto) in enumerate(zip(new, protos), start=self.n):
+            self.pos[id(e)] = i
+            for nid in e.get("fjc_nids") or []:
+                self.by_nid[str(nid)].add(i)
             gid = alias.get(" ".join((proto.get("normalized_name") or e.get("normalized_name") or "").lower().split()))
             if gid:
                 self.by_alias[gid].append(i)
@@ -264,6 +269,21 @@ class SavedIndex:
             for k in blocks.get(proto.get("mention_id") or "") or []:
                 self.by_block[k].append(i)
         self.n = len(saved)
+
+    def note_absorb(self, entity: dict) -> None:
+        """Index FJC ids a saved entity gained by absorbing a new one."""
+        i = self.pos.get(id(entity))
+        if i is None:
+            return
+        for nid in entity.get("fjc_nids") or []:
+            self.by_nid[str(nid)].add(i)
+
+    def fjc_hits(self, saved: list[dict], nids: set[str], cfg: dict) -> list[dict]:
+        self.sync(saved, cfg)
+        hit: set[int] = set()
+        for nid in nids:
+            hit |= self.by_nid.get(str(nid)) or set()
+        return [saved[i] for i in sorted(hit)]
 
     def candidates(self, saved: list[dict], new_mentions: list[dict], cfg: dict) -> list[dict]:
         if not saved:
@@ -295,7 +315,7 @@ def link_against_saved(
 
     Saved entities are never merged with each other.
     """
-    stats = {"tier0_links": 0, "tier2_links": 0, "tier3_links": 0, "new": 0, "tier3_calls": 0}
+    stats = {"fjc_links": 0, "tier0_links": 0, "tier2_links": 0, "tier3_links": 0, "new": 0, "tier3_calls": 0}
     still_new: list[dict] = []
     alias = _alias_index(cfg)
     surnames = _common_surnames(cfg)
@@ -309,7 +329,33 @@ def link_against_saved(
             still_new.append(ent)
             stats["new"] += 1
             continue
+        # Same FJC id = same judge, in any court: link directly. Different FJC
+        # ids = different judges: never link those, whatever the name says.
+        nids = {str(x) for x in ent.get("fjc_nids") or []}
+        if nids:
+            nid_hits = index.fjc_hits(saved, nids, cfg)
+            if nid_hits:
+                chosen = sorted(nid_hits, key=lambda h: str(h.get("sjid") or ""))[0]
+                _absorb(chosen, ent, members)
+                index.note_absorb(chosen)
+                stats["fjc_links"] += 1
+                journal.log(
+                    {
+                        "decision": "MERGE_TIER0",
+                        "method": "incremental.link_fjc_nid",
+                        "mention_id_a": members[0]["mention_id"],
+                        "mention_id_b": (chosen.get("_proto") or {}).get("mention_id"),
+                        "entity_type": cfg.get("entity_type"),
+                        "confidence": 100,
+                        "rationale": f"Same FJC id {sorted(nids & set(map(str, chosen.get('fjc_nids') or [])))} as saved {chosen.get('sjid')}",
+                        "signals": ["incremental", "fjc_nid_match"],
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                )
+                continue
         cands = index.candidates(saved, members, cfg)
+        if nids:
+            cands = [c for c in cands if not (c.get("fjc_nids") and not nids & {str(x) for x in c["fjc_nids"]})]
         if not cands:
             still_new.append(ent)
             stats["new"] += 1
@@ -334,6 +380,7 @@ def link_against_saved(
         if hits:
             chosen = _pick_hit(hits, ent)
             _absorb(chosen, ent, members)
+            index.note_absorb(chosen)
             stats["tier0_links"] += 1
             journal.log(
                 {
@@ -379,6 +426,7 @@ def link_against_saved(
                 break
         if linked is not None:
             _absorb(linked, ent, members)
+            index.note_absorb(linked)
             stats["tier2_links"] += 1
             continue
         ambiguous = [p for p in (t2.get("ambiguous") or []) if proto_new["mention_id"] in (p[0], p[1])]
@@ -395,6 +443,7 @@ def link_against_saved(
                     break
             if linked is not None:
                 _absorb(linked, ent, members)
+                index.note_absorb(linked)
                 stats["tier3_links"] += 1
                 continue
         still_new.append(ent)
