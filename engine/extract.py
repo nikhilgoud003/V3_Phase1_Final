@@ -511,6 +511,14 @@ def extract_from_case(case: dict, cfg: dict, source_file: str | None = None) -> 
                 )
             )
 
+    alias_spec = cfg.get("alias_extraction") or {}
+    if alias_spec.get("enabled"):
+        mentions.extend(
+            _extract_party_aliases(
+                case, cfg, mentions, alias_spec, source_file, party_neg, counsel_neg, personnel_neg
+            )
+        )
+
     # Attach co-mentions and transfer partners within case
     norms = [m["normalized_name"] for m in mentions]
     for m in mentions:
@@ -524,6 +532,84 @@ def extract_from_case(case: dict, cfg: dict, source_file: str | None = None) -> 
         m["transfer_partners"] = sorted(partners)
 
     return mentions, transfer_pairs
+
+
+def _extract_party_aliases(
+    case: dict,
+    cfg: dict,
+    mentions: list[dict],
+    spec: dict,
+    source_file: str | None,
+    party_neg: set[str],
+    counsel_neg: set[str],
+    personnel_neg: set[str],
+) -> list[dict]:
+    """fka/aka/dba (same entity) and successor/alter ego/... (related entity)
+    names from each listed party's raw_info (config alias_extraction).
+
+    A name equal to any listed party or counsel name in the case is dropped.
+    Same-entity aliases carry alias_of (the mention they name); the Tier0
+    explicit_alias_link rule joins them.
+    """
+    from engine.party_alias import parse_raw_info
+
+    main_by_enum = {
+        m["party_enum"]: m
+        for m in mentions
+        if m.get("docket_source") == "case_parties" and m.get("party_enum") is not None
+    }
+    out: list[dict] = []
+    seen: set[str] = set()
+    field = spec.get("source_field") or "raw_info"
+    for i, party in enumerate(case.get("parties") or []):
+        main = main_by_enum.get(i)
+        if main is None:
+            continue
+        raw_info = (party.get("entity_info") or {}).get(field) or ""
+        related_ids: dict[str, str] = {}
+        for item in parse_raw_info(raw_info, spec):
+            rel, same = item["relationship"], item["same_entity"]
+            source = {
+                "id": "party_alias",
+                "role": main.get("role"),
+                "docket_source": "party_alias",
+                "extraction_method": f"raw_info_{rel}",
+            }
+            extra = {
+                "party_enum": i,
+                "party_name": main.get("party_name"),
+                "party_role": main.get("party_role"),
+                "source_file": source_file,
+            }
+            m = _emit_mention(
+                raw=item["name"],
+                cfg=cfg,
+                case=case,
+                source=source,
+                extra=extra,
+                party_neg=party_neg,
+                counsel_neg=counsel_neg,
+                personnel_neg=personnel_neg,
+            )
+            if not m or m["mention_id"] in seen:
+                continue
+            m = apply_office_classification(m, cfg)
+            if m.pop("_drop_classified", False):
+                continue
+            m["relationship_type"] = rel
+            m["same_entity"] = same
+            m["related_party"] = main.get("raw_name")
+            if same:
+                target = main["mention_id"] if item["subject"] is None else related_ids.get(item["subject"])
+                if target is None:
+                    continue
+                m["alias_of"] = target
+            else:
+                m["related_to_mention"] = main["mention_id"]
+                related_ids[item["name"]] = m["mention_id"]
+            seen.add(m["mention_id"])
+            out.append(m)
+    return out
 
 
 def _resolve_json_files(cfg: dict, json_dir: str | None, limit: int | None) -> list[Path]:

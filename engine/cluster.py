@@ -344,8 +344,17 @@ def _split_by_name_compat(mentions: list[dict], cfg: dict) -> list[list[dict]]:
         if ri != rj:
             parent[rj] = ri
 
+    # An fka/aka/dba alias read from the entity's own record is the same
+    # entity even when the names look unrelated ("Orlando RV" dba).
+    pos = {m.get("mention_id"): i for i, m in enumerate(mentions)}
+    for i, m in enumerate(mentions):
+        if m.get("same_entity") and m.get("alias_of") in pos:
+            union(pos[m["alias_of"]], i)
+
     for i in range(n):
         for j in range(i + 1, n):
+            if find(i) == find(j):
+                continue
             ok, _ = names_compatible(mentions[i], mentions[j], cfg=cfg)
             if ok:
                 union(i, j)

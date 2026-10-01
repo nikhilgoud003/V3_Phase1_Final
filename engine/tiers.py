@@ -1627,6 +1627,34 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                     )
             continue
 
+        if rule.get("type") == "explicit_alias_link":
+            # Alias read from the entity's own record (fka/aka/dba) → same entity.
+            for m in mentions:
+                target = m.get("alias_of")
+                if not target or target not in by_id or not m.get("same_entity"):
+                    continue
+                if uf.find(m["mention_id"]) == uf.find(target) or not uf.union(target, m["mention_id"]):
+                    continue
+                stats["merges"] += 1
+                stats["rules_fired"][rid] += 1
+                journal.log(
+                    {
+                        "decision_id": f"dec_{journal.n:08d}",
+                        "mention_id_a": target,
+                        "mention_id_b": m["mention_id"],
+                        "entity_type": cfg.get("entity_type"),
+                        "decision": "MERGE_TIER0",
+                        "confidence": int(rule.get("confidence", 100)),
+                        "method": rule.get("method") or f"tier0.{rid}",
+                        "rationale": f"{m.get('relationship_type')} alias in the entity's own record",
+                        "signals": ["explicit_alias", str(m.get("relationship_type"))],
+                        "evidence": {"rule": rid, "alias": m.get("raw_name"), "of": by_id[target].get("raw_name")},
+                        "timestamp": _now(),
+                        "config_version": cfg.get("version"),
+                    }
+                )
+            continue
+
         if rule.get("type") != "conjunction":
             continue
 

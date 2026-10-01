@@ -433,6 +433,14 @@ tier0:
   # ("Quiznos Master LLC, The", "DOES 1-10, inclusive").
   company_legal_form_ignore_trailing: [the, inclusive]
   rules:
+    - id: explicit_alias
+      description: >
+        fka / aka / dba name read from the party's own raw_info → same entity
+        (see alias_extraction). Successor / alter ego names are not joined.
+      type: explicit_alias_link
+      confidence: 100
+      method: tier0.explicit_alias
+
     - id: exact_normalized_name_same_ucid
       description: "Identical normalized name within the same case → same party mention cluster"
       type: conjunction
@@ -499,6 +507,30 @@ tier0:
         forbid_office_class: [placeholder]
       confidence: 95
       method: tier0.exact_federal_agency_global
+
+# Aliases and related entities from each party's raw_info text
+# (engine/party_alias.py). Markers are grammar phrases (regex, case-insensitive),
+# not names. same_entity: another name of the SAME party (joined to it by the
+# Tier0 explicit_alias rule). related_entity: a DIFFERENT entity that has a
+# relationship with the party (kept as its own entity, relationship recorded).
+alias_extraction:
+  enabled: true
+  source_field: raw_info          # parties[].entity_info.raw_info
+  markers:
+    same_entity:
+      fka: ['formerly known as', 'f/k/a', 'fka']
+      aka: ['also known as', 'a/k/a', 'aka']
+      dba: ['doing business as', 'd/b/a', 'dba', 'trading as']
+    related_entity:
+      successor: ['successors? and/or parent of', 'successors? (?:in interest |by merger )?(?:to|of|for)']
+      predecessor: ['predecessors? (?:in interest )?(?:to|of)']
+      alter_ego: ['alter ego of']
+      care_of: ['c/o', 'care of']
+      parent: ['parent of']
+      subsidiary: ['subsidiary of']
+  # A name ends at a stop word; strip words are removed from its edges.
+  stop_words: [individually, etc, et, deceased]
+  strip_words: [and, or, as, a, an, its, the]
 
 # Same-case co-party barrier (general): two different names listed as separate
 # entries of one case's party list are different entities. Enforced inside
