@@ -357,6 +357,38 @@ def corp_core_for_mention(m: dict, cfg: dict) -> str | None:
     return v or None
 
 
+_LEGAL_FORM_CACHE: dict[int, list[tuple[str, tuple[str, ...]]]] = {}
+
+
+def company_legal_form(m: dict, cfg: dict) -> str | None:
+    """Legal-form family from the raw name's ending (config tier0.company_legal_forms).
+
+    Read from raw_name because normalization strips corporate suffixes.
+    Returns e.g. "corp" for "Xerox Corporation", "bank_na" for "Capital One, N.A.",
+    or None when the name does not end in a legal form.
+    """
+    spec = (cfg.get("tier0") or {}).get("company_legal_forms") or {}
+    if not spec:
+        return None
+    forms = _LEGAL_FORM_CACHE.get(id(spec))
+    if forms is None:
+        forms = []
+        for fam, seqs in spec.items():
+            for seq in seqs or []:
+                forms.append((str(fam), tuple(str(seq).lower().split())))
+        forms.sort(key=lambda x: -len(x[1]))
+        _LEGAL_FORM_CACHE[id(spec)] = forms
+    raw = (m.get("raw_name") or "").lower().replace("&", " and ")
+    toks = re.sub(r"[^a-z0-9 ]", " ", raw).split()
+    ignore_tail = {str(w).lower() for w in (cfg.get("tier0") or {}).get("company_legal_form_ignore_trailing") or []}
+    while toks and toks[-1] in ignore_tail:
+        toks.pop()
+    for fam, seq in forms:
+        if seq and len(toks) > len(seq) and tuple(toks[-len(seq):]) == seq:
+            return fam
+    return None
+
+
 def corporate_shared_prefix_conflict(ma: dict, mb: dict, cfg: dict) -> bool:
     """Block corporate auto-merges that share token-1 but differ on token-2 (e.g. Owens).
 
@@ -1041,6 +1073,8 @@ def _block_slot_value(
     if spec in {"corp_core", "corp_core_from_normalized_name"} and cfg:
         v = corp_core_for_mention(m, cfg)
         return v
+    if spec == "company_legal_form" and cfg:
+        return company_legal_form(m, cfg)
     v = m.get(spec)
     if v is None or v == "":
         return None
@@ -1382,6 +1416,8 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
         if field in {"corp_core", "corp_core_from_normalized_name"}:
             v = corp_core_for_mention(m, cfg)
             return v or None
+        if field == "company_legal_form":
+            return company_legal_form(m, cfg)
         if field in {"first_last_initials", "initials"}:
             v = first_last_initials(m.get("normalized_name") or "")
             return v or None

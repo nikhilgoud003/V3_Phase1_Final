@@ -413,6 +413,24 @@ tier0:
       merge_scope: global
       confidence: 100
       method: tier0.gov_usa_alias
+  # Legal-form families read from the end of the raw name (normalization strips
+  # these). Used by exact_company_name_global and the company_name_global block.
+  # Families must match: "GlaxoSmithKline LLC" and "GlaxoSmithKline plc" stay apart.
+  company_legal_forms:
+    corp: [inc, incorporated, corp, corporation]
+    company: [company, co]
+    llc: [llc, l l c]
+    llp: [llp, l l p]
+    lp: [lp, l p]
+    ltd: [ltd, limited]
+    plc: [plc]
+    ag: [ag]
+    gmbh: [gmbh]
+    sa: [s a]
+    bank_na: [n a, national association]
+  # Trailing words skipped before reading the legal form
+  # ("Quiznos Master LLC, The", "DOES 1-10, inclusive").
+  company_legal_form_ignore_trailing: [the, inclusive]
   rules:
     - id: exact_normalized_name_same_ucid
       description: "Identical normalized name within the same case → same party mention cluster"
@@ -456,6 +474,19 @@ tier0:
       confidence: 95
       method: tier0.exact_corp_core_court
 
+    - id: exact_company_name_global
+      description: >
+        Same normalized name + same legal-form family (Inc/Corp, LLC, N.A., ...)
+        → same company in any court. Companies only: people, government bodies
+        and placeholders keep the court-scoped rules above.
+      type: conjunction
+      fields: [normalized_name, company_legal_form]
+      min_name_tokens: 1
+      match:
+        forbid_office_class: [placeholder, government]
+      confidence: 95
+      method: tier0.exact_company_name_global
+
 tier1:
   enabled: true
   compound_surnames: []
@@ -488,6 +519,13 @@ tier1:
         court: court
         surname: surname_from_normalized_name
         year: year
+    # Court-free block for companies only, so the same company in another
+    # court becomes a candidate (every other party block includes the court).
+    - id: company_name_global
+      key_template: "{name}|{form}"
+      fields:
+        name: normalized_name
+        form: company_legal_form
   residual_bucket: "_UNBLOCKED_"
 
 tier2:
