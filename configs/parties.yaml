@@ -410,10 +410,37 @@ tier0:
         - us
         - united states
         - united states of america
+        - the united states of america
       merge_scope: global
       confidence: 100
       method: tier0.gov_usa_alias
+  # Legal-form families read from the end of the raw name (normalization strips
+  # these). Used by exact_company_name_global and the company_name_global block.
+  # Families must match: "GlaxoSmithKline LLC" and "GlaxoSmithKline plc" stay apart.
+  company_legal_forms:
+    corp: [inc, incorporated, corp, corporation]
+    company: [company, co]
+    llc: [llc, l l c]
+    llp: [llp, l l p]
+    lp: [lp, l p]
+    ltd: [ltd, limited]
+    plc: [plc]
+    ag: [ag, aktiengesellschaft]
+    gmbh: [gmbh]
+    sa: [s a]
+    bank_na: [n a, national association]
+  # Trailing words skipped before reading the legal form
+  # ("Quiznos Master LLC, The", "DOES 1-10, inclusive").
+  company_legal_form_ignore_trailing: [the, inclusive]
   rules:
+    - id: explicit_alias
+      description: >
+        fka / aka / dba name read from the party's own raw_info → same entity
+        (see alias_extraction). Successor / alter ego names are not joined.
+      type: explicit_alias_link
+      confidence: 100
+      method: tier0.explicit_alias
+
     - id: exact_normalized_name_same_ucid
       description: "Identical normalized name within the same case → same party mention cluster"
       type: conjunction
@@ -456,6 +483,79 @@ tier0:
       confidence: 95
       method: tier0.exact_corp_core_court
 
+    - id: exact_company_name_global
+      description: >
+        Same normalized name + same legal-form family (Inc/Corp, LLC, N.A., ...)
+        → same company in any court. Companies only: people, government bodies
+        and placeholders keep the court-scoped rules above.
+      type: conjunction
+      fields: [normalized_name, company_legal_form]
+      min_name_tokens: 1
+      match:
+        forbid_office_class: [placeholder, government]
+      confidence: 95
+      method: tier0.exact_company_name_global
+
+    - id: exact_federal_agency_global
+      description: >
+        Whole party name is one federal agency from the official Federal Register
+        list (see federal_agencies) → one agency entity in any court.
+      type: conjunction
+      fields: [federal_agency_id]
+      min_name_tokens: 1
+      match:
+        forbid_office_class: [placeholder]
+      confidence: 95
+      method: tier0.exact_federal_agency_global
+
+# Aliases and related entities from each party's raw_info text
+# (engine/party_alias.py). Markers are grammar phrases (regex, case-insensitive),
+# not names. same_entity: another name of the SAME party (joined to it by the
+# Tier0 explicit_alias rule). related_entity: a DIFFERENT entity that has a
+# relationship with the party (kept as its own entity, relationship recorded).
+alias_extraction:
+  enabled: true
+  source_field: raw_info          # parties[].entity_info.raw_info
+  markers:
+    same_entity:
+      fka: ['formerly known as', 'f/k/a', 'fka']
+      aka: ['also known as', 'a/k/a', 'aka']
+      dba: ['doing business as', 'd/b/a', 'dba', 'trading as']
+    related_entity:
+      successor: ['successors? and/or parent of', 'successors? (?:in interest |by merger )?(?:to|of|for)']
+      predecessor: ['predecessors? (?:in interest )?(?:to|of)']
+      alter_ego: ['alter ego of']
+      care_of: ['c/o', 'care of']
+      parent: ['parent of']
+      subsidiary: ['subsidiary of']
+  # A name ends at a stop word; strip words are removed from its edges.
+  stop_words: [individually, etc, et, deceased]
+  strip_words: [and, or, as, a, an, its, the]
+
+# Same-case co-party barrier (general): two different names listed as separate
+# entries of one case's party list are different entities. Enforced inside
+# the union step, so no tier (Tier0 key, UCID anchor, Tier2, Tier3) can merge
+# them, directly or through a third mention.
+coparty_barrier:
+  enabled: true
+  docket_sources: [case_parties]
+
+# Federal agencies from the official Federal Register list (data file records
+# its source URL and download date). Matching is general: the whole party name
+# must equal an agency name in catalog or docket word order. No abbreviations
+# (the list's own short names clash with docket usage, e.g. USA, DOC).
+federal_agencies:
+  enabled: true
+  data_path: data/external/federal_agencies_federalregister.json
+  # Catalog "Justice Department" is also matched as "Department of Justice".
+  invert_head_words: [department, bureau, office, corps]
+  # Words that mark a name as federal when written before the agency name.
+  federal_prefixes: [united states, u s, us, the united states, federal]
+  # States have departments/bureaus/offices with the same names, and very short
+  # names are ambiguous: these need a federal prefix.
+  require_prefix_heads: [department, bureau, office]
+  min_tokens_without_prefix: 3
+
 tier1:
   enabled: true
   compound_surnames: []
@@ -488,6 +588,18 @@ tier1:
         court: court
         surname: surname_from_normalized_name
         year: year
+    # Court-free block for companies only, so the same company in another
+    # court becomes a candidate (every other party block includes the court).
+    - id: company_name_global
+      key_template: "{name}|{form}"
+      fields:
+        name: normalized_name
+        form: company_legal_form
+    # Court-free block for federal agencies (same reason as company_name_global).
+    - id: federal_agency_global
+      key_template: "{agency}"
+      fields:
+        agency: federal_agency_id
   residual_bucket: "_UNBLOCKED_"
 
 tier2:

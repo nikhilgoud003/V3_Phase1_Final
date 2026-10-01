@@ -162,6 +162,31 @@ def apply_llm_name_validity(
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     jfh = journal_path.open("a", encoding="utf-8")
 
+    # Fetch the answers this loop will ask for, in parallel. The order and the
+    # max_calls cut-off are the loop's own, so the decisions are unchanged.
+    prefetched: dict[str, Any] = {}
+    n_par = int(llm_cfg.get("parallel_requests") or 1)
+    if n_par > 1:
+        todo: list[str] = []
+        for span_key, group in candidates.items():
+            sample_raw = (group[0].get("raw_name") or group[0].get("normalized_name") or "").strip()
+            if _cache_key(sample_raw, model, prompt_hash) in cache or sample_raw in todo:
+                continue
+            if len(todo) >= max_calls:
+                break
+            todo.append(sample_raw)
+        if len(todo) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _ask(raw: str) -> Any:
+                try:
+                    return call_ollama_json(model, prompt_tmpl.replace("{span}", raw), endpoint)
+                except Exception as e:  # replayed below exactly as the loop would see it
+                    return e
+
+            with ThreadPoolExecutor(min(n_par, len(todo))) as ex:
+                prefetched = dict(zip(todo, ex.map(_ask, todo)))
+
     try:
         for span_key, group in candidates.items():
             sample_raw = (group[0].get("raw_name") or group[0].get("normalized_name") or "").strip()
@@ -174,7 +199,12 @@ def apply_llm_name_validity(
                     break
                 prompt = prompt_tmpl.replace("{span}", sample_raw)
                 try:
-                    result = call_ollama_json(model, prompt, endpoint)
+                    if sample_raw in prefetched:
+                        result = prefetched.pop(sample_raw)
+                        if isinstance(result, Exception):
+                            raise result
+                    else:
+                        result = call_ollama_json(model, prompt, endpoint)
                     calls += 1
                     stats["llm_calls"] += 1
                 except Exception as e:

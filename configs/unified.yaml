@@ -1,0 +1,14 @@
+# Settings for the unified one-pass run (scripts/unified_5file_poc.py) that
+# are not specific to one entity type.
+
+schema_free_walk:
+  # Qwen types JSON fields that no YAML source covers and emits their values
+  # as mentions. Off by default: on the 1,000-file pilot it added 62 mentions,
+  # all duplicates, attorney names or junk (county names, scraper artifacts),
+  # and it used about 21% of Qwen calls. Override per run with --schema-walk on.
+  enabled: false
+
+# Processes for JSON reading + per-type extraction (spaCy). Files are extracted
+# ahead in parallel and resolved in their original order, so results do not
+# change. 0 = CPU count - 1; 1 = in-process. Override with --workers.
+extract_workers: 0

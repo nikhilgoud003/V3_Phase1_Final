@@ -28,6 +28,7 @@ from .normalize import first_last_initials, initial_token_ratio, is_initial_toke
 from .preflight import CascadeFailedError, PreflightError, check_tier3_error_rate, preflight_ollama
 from .tier3_citation import apply_citation_and_match_rails
 from .provenance import DecisionJournal, append_jsonl
+from .run_cache import file_memo
 
 
 def prompt_sha256(text: str) -> str:
@@ -131,7 +132,8 @@ def apply_tier0_alias_groups(
                     continue
                 if transfer_conflict(by_id[root], by_id[other]):
                     continue
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"][f"alias_group:{gid}"] += 1
                 journal.log(
@@ -200,10 +202,54 @@ def _cache_key(a: dict, b: dict) -> str:
     return f"{court}|{na}|{nb}|{role}"
 
 
+def party_slot(m: dict, cfg: dict) -> tuple[str, Any, str] | None:
+    """(case, party entry, listed name) for a mention from a case party list.
+
+    Config coparty_barrier: only mentions from the listed docket sources that
+    carry a party entry index get a slot. The listed name is the entry's own
+    name (party_name), so an alias read from that entry shares its slot.
+    """
+    spec = cfg.get("coparty_barrier") or {}
+    if not spec.get("enabled"):
+        return None
+    if (m.get("docket_source") or "") not in set(spec.get("docket_sources") or []):
+        return None
+    if m.get("party_enum") is None or not m.get("ucid"):
+        return None
+    name = " ".join(_agency_tokens(m.get("party_name") or m.get("raw_name") or ""))
+    return (str(m["ucid"]), m["party_enum"], name) if name else None
+
+
+def coparty_conflict(slots_a, slots_b) -> tuple[str, Any, Any] | None:
+    """Two different listed names from separate entries of the same case."""
+    if not slots_a or not slots_b:
+        return None
+    by_case: dict[str, list[tuple[Any, str]]] = defaultdict(list)
+    small, big = (slots_a, slots_b) if len(slots_a) <= len(slots_b) else (slots_b, slots_a)
+    for u, e, n in small:
+        by_case[u].append((e, n))
+    for u, e, n in big:
+        for e2, n2 in by_case.get(u, ()):
+            if e2 != e and n2 != n:
+                return (u, n, n2)
+    return None
+
+
 class UnionFind:
     def __init__(self) -> None:
         self.parent: dict[str, str] = {}
         self.rank: dict[str, int] = {}
+        # Optional co-party barrier: root -> frozenset of party slots.
+        self.slots: dict[str, frozenset] | None = None
+        self.blocked: list[tuple[str, str, tuple]] = []
+
+    def enable_slots(self, slot_of: dict[str, tuple | None]) -> None:
+        self.slots = {}
+        for x, slot in slot_of.items():
+            self.add(x)
+            self.slots[self.find(x)] = self.slots.get(self.find(x), frozenset()) | (
+                frozenset([slot]) if slot else frozenset()
+            )
 
     def add(self, x: str) -> None:
         if x not in self.parent:
@@ -217,17 +263,30 @@ class UnionFind:
             x = self.parent[x]
         return x
 
-    def union(self, a: str, b: str) -> None:
+    def union(self, a: str, b: str) -> bool:
+        """Join a and b. Returns False when the co-party barrier blocks it."""
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
-            return
+            return True
+        if self.slots is not None:
+            sa, sb = self.slots.get(ra, frozenset()), self.slots.get(rb, frozenset())
+            why = coparty_conflict(sa, sb)
+            if why:
+                self.blocked.append((a, b, why))
+                return False
         if self.rank[ra] < self.rank[rb]:
             self.parent[ra] = rb
+            root, child = rb, ra
         elif self.rank[ra] > self.rank[rb]:
             self.parent[rb] = ra
+            root, child = ra, rb
         else:
             self.parent[rb] = ra
             self.rank[ra] += 1
+            root, child = ra, rb
+        if self.slots is not None:
+            self.slots[root] = self.slots.get(root, frozenset()) | self.slots.pop(child, frozenset())
+        return True
 
     def components(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = defaultdict(list)
@@ -258,6 +317,7 @@ def build_token_profile_for_run(mentions: list[dict], cfg: dict) -> dict:
     return build_token_profile(mentions, fjc_surnames, min_occurrences=min_occ)
 
 
+@file_memo
 def load_common_surnames(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -353,6 +413,95 @@ def corp_core_for_mention(m: dict, cfg: dict) -> str | None:
         hyphen_to_space=bool(cc_cfg.get("hyphen_to_space", True)),
     )
     return v or None
+
+
+_LEGAL_FORM_CACHE: dict[int, list[tuple[str, tuple[str, ...]]]] = {}
+
+
+def company_legal_form(m: dict, cfg: dict) -> str | None:
+    """Legal-form family from the raw name's ending (config tier0.company_legal_forms).
+
+    Read from raw_name because normalization strips corporate suffixes.
+    Returns e.g. "corp" for "Xerox Corporation", "bank_na" for "Capital One, N.A.",
+    or None when the name does not end in a legal form.
+    """
+    spec = (cfg.get("tier0") or {}).get("company_legal_forms") or {}
+    if not spec:
+        return None
+    forms = _LEGAL_FORM_CACHE.get(id(spec))
+    if forms is None:
+        forms = []
+        for fam, seqs in spec.items():
+            for seq in seqs or []:
+                forms.append((str(fam), tuple(str(seq).lower().split())))
+        forms.sort(key=lambda x: -len(x[1]))
+        _LEGAL_FORM_CACHE[id(spec)] = forms
+    raw = (m.get("raw_name") or "").lower().replace("&", " and ")
+    toks = re.sub(r"[^a-z0-9 ]", " ", raw).split()
+    ignore_tail = {str(w).lower() for w in (cfg.get("tier0") or {}).get("company_legal_form_ignore_trailing") or []}
+    while toks and toks[-1] in ignore_tail:
+        toks.pop()
+    for fam, seq in forms:
+        if seq and len(toks) > len(seq) and tuple(toks[-len(seq):]) == seq:
+            return fam
+    return None
+
+
+def _agency_tokens(text: str) -> tuple[str, ...]:
+    t = (text or "").lower().replace("&", " and ")
+    return tuple(re.sub(r"[^a-z0-9 ]", " ", t).split())
+
+
+@file_memo
+def _federal_agency_index(
+    data_path: Path,
+    invert_heads: tuple[str, ...],
+    federal_prefixes: tuple[str, ...],
+    require_prefix_heads: tuple[str, ...],
+    min_tokens_without_prefix: int,
+) -> dict[tuple[str, ...], str]:
+    """Docket-form name variants -> agency id, built from the official list.
+
+    Catalog names ("Treasury Department") are also indexed in docket order,
+    with and without "the" ("department of treasury", "department of the
+    treasury"). Forms that could be a state body or are short need a federal
+    prefix. A variant claimed by two agencies is dropped.
+    """
+    rows = json.loads(Path(data_path).read_text(encoding="utf-8")).get("agencies") or []
+    prefixes = [tuple(p.split()) for p in federal_prefixes]
+    claims: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    for row in rows:
+        base = _agency_tokens(row.get("name") or "")
+        if not base:
+            continue
+        aid = f"fr:{row.get('slug') or row.get('id')}"
+        forms = {base}
+        if len(base) > 1 and base[-1] in invert_heads:
+            forms.add((base[-1], "of") + base[:-1])
+            forms.add((base[-1], "of", "the") + base[:-1])
+        for f in forms:
+            needs_prefix = f[0] in require_prefix_heads or len(f) < min_tokens_without_prefix
+            if not needs_prefix:
+                claims[f].add(aid)
+                claims[("the",) + f].add(aid)
+            for pre in prefixes:
+                claims[pre + f].add(aid)
+    return {k: next(iter(v)) for k, v in claims.items() if len(v) == 1}
+
+
+def federal_agency_id(m: dict, cfg: dict) -> str | None:
+    """Agency id when the whole party name is a federal agency name (config federal_agencies)."""
+    fa = cfg.get("federal_agencies") or {}
+    if not fa.get("enabled") or not fa.get("data_path"):
+        return None
+    index = _federal_agency_index(
+        resolve_path(cfg, fa["data_path"]),
+        tuple(str(x).lower() for x in fa.get("invert_head_words") or []),
+        tuple(str(x).lower() for x in fa.get("federal_prefixes") or []),
+        tuple(str(x).lower() for x in fa.get("require_prefix_heads") or []),
+        int(fa.get("min_tokens_without_prefix") or 3),
+    )
+    return index.get(_agency_tokens(m.get("raw_name") or ""))
 
 
 def corporate_shared_prefix_conflict(ma: dict, mb: dict, cfg: dict) -> bool:
@@ -1039,6 +1188,10 @@ def _block_slot_value(
     if spec in {"corp_core", "corp_core_from_normalized_name"} and cfg:
         v = corp_core_for_mention(m, cfg)
         return v
+    if spec == "company_legal_form" and cfg:
+        return company_legal_form(m, cfg)
+    if spec == "federal_agency_id" and cfg:
+        return federal_agency_id(m, cfg)
     v = m.get(spec)
     if v is None or v == "":
         return None
@@ -1380,6 +1533,10 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
         if field in {"corp_core", "corp_core_from_normalized_name"}:
             v = corp_core_for_mention(m, cfg)
             return v or None
+        if field == "company_legal_form":
+            return company_legal_form(m, cfg)
+        if field == "federal_agency_id":
+            return federal_agency_id(m, cfg)
         if field in {"first_last_initials", "initials"}:
             v = first_last_initials(m.get("normalized_name") or "")
             return v or None
@@ -1448,7 +1605,8 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                         )
                         continue
                     # Distinct FJC NIDs should never reach this bucket; same NID → merge
-                    uf.union(root, other)
+                    if not uf.union(root, other):
+                        continue
                     stats["merges"] += 1
                     stats["rules_fired"][rid] += 1
                     journal.log(
@@ -1467,6 +1625,34 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                             "config_version": cfg.get("version"),
                         }
                     )
+            continue
+
+        if rule.get("type") == "explicit_alias_link":
+            # Alias read from the entity's own record (fka/aka/dba) → same entity.
+            for m in mentions:
+                target = m.get("alias_of")
+                if not target or target not in by_id or not m.get("same_entity"):
+                    continue
+                if uf.find(m["mention_id"]) == uf.find(target) or not uf.union(target, m["mention_id"]):
+                    continue
+                stats["merges"] += 1
+                stats["rules_fired"][rid] += 1
+                journal.log(
+                    {
+                        "decision_id": f"dec_{journal.n:08d}",
+                        "mention_id_a": target,
+                        "mention_id_b": m["mention_id"],
+                        "entity_type": cfg.get("entity_type"),
+                        "decision": "MERGE_TIER0",
+                        "confidence": int(rule.get("confidence", 100)),
+                        "method": rule.get("method") or f"tier0.{rid}",
+                        "rationale": f"{m.get('relationship_type')} alias in the entity's own record",
+                        "signals": ["explicit_alias", str(m.get("relationship_type"))],
+                        "evidence": {"rule": rid, "alias": m.get("raw_name"), "of": by_id[target].get("raw_name")},
+                        "timestamp": _now(),
+                        "config_version": cfg.get("version"),
+                    }
+                )
             continue
 
         if rule.get("type") != "conjunction":
@@ -1597,7 +1783,8 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                     )
                     continue
                 # A4 / pair_allowed is Tier2+Tier3 only — never block Tier0 exact keys
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"][rid] += 1
                 journal.log(
@@ -1678,7 +1865,8 @@ def _tier0_ucid_truncated_span_merges(
                 ok_name, _ = names_compatible(by_id[root], by_id[other], cfg=cfg)
                 if not ok_name or transfer_conflict(by_id[root], by_id[other]):
                     continue
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"]["ucid_truncated_span"] = stats["rules_fired"].get("ucid_truncated_span", 0) + 1
                 journal.log(
@@ -1740,7 +1928,8 @@ def _tier0_ucid_prefix_span_merges(
                 ok_name, _ = names_compatible(by_id[root], by_id[other], cfg=cfg)
                 if not ok_name or transfer_conflict(by_id[root], by_id[other]):
                     continue
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"]["ucid_prefix_span"] = stats["rules_fired"].get("ucid_prefix_span", 0) + 1
                 journal.log(
@@ -2158,7 +2347,9 @@ def apply_tier2_auto_merges(
             continue
 
         if sim >= auto_min and not (barrier and not allow_auto):
-            uf.union(a, b)
+            if not uf.union(a, b):
+                stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
+                continue
             stats["auto_merges"] += 1
             journal.log(
                 {
@@ -2205,6 +2396,39 @@ def load_output_schema(cfg: dict) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# Run-wide LLM answer cache keyed by model + the full prompt. The prompt holds
+# all the evidence the model sees (case, co-mentions, ...), so a cached answer
+# is the answer the same request returns (temperature 0). Callers still count
+# each call, so Tier3 budgets and every decision are unchanged.
+_LLM_MEMO: dict[str, dict] = {}
+LLM_MEMO_STATS = {"hits": 0, "misses": 0}
+
+
+def _llm_memo_key(model: str, prompt: str) -> str:
+    return hashlib.sha256(json.dumps([model, "json", prompt]).encode("utf-8")).hexdigest()
+
+
+def load_llm_memo(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    for line in path.open(encoding="utf-8"):
+        if line.strip():
+            rec = json.loads(line)
+            _LLM_MEMO[rec["key"]] = rec["response"]
+    return len(_LLM_MEMO)
+
+
+def save_llm_memo(path: Path) -> None:
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for k, v in _LLM_MEMO.items():
+            f.write(json.dumps({"key": k, "response": v}, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
 def call_ollama_json(
     model: str,
     prompt: str,
@@ -2212,6 +2436,26 @@ def call_ollama_json(
     *,
     retries: int = 5,
     retry_sleep_sec: float = 3.0,
+) -> dict:
+    import copy
+
+    key = _llm_memo_key(model, prompt)
+    if key in _LLM_MEMO:
+        LLM_MEMO_STATS["hits"] += 1
+        return copy.deepcopy(_LLM_MEMO[key])
+    LLM_MEMO_STATS["misses"] += 1
+    out = _call_ollama_json_uncached(model, prompt, endpoint, retries=retries, retry_sleep_sec=retry_sleep_sec)
+    _LLM_MEMO[key] = copy.deepcopy(out)
+    return out
+
+
+def _call_ollama_json_uncached(
+    model: str,
+    prompt: str,
+    endpoint: str,
+    *,
+    retries: int,
+    retry_sleep_sec: float,
 ) -> dict:
     import time
     import urllib.error
@@ -2887,8 +3131,13 @@ def tier3_adjudicate(
                 f"[abstain large-cluster fuse: conf={conf}<{barrier_llm_min}] " + rationale
             )
 
+        if decision == "MATCH" and not uf.union(a, b):
+            # Same-case co-party barrier overrides the LLM.
+            stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
+            decision = "NO_MATCH"
+            signals = sorted(set(signals + ["coparty_same_case"]))
+            rationale = "[co-party barrier: separately listed parties in the same case] " + rationale
         if decision == "MATCH":
-            uf.union(a, b)
             stats["merges"] += 1
             out_decision = "MERGE_TIER3"
         elif decision == "NO_MATCH":
@@ -2990,6 +3239,10 @@ def tier3_adjudicate(
     return stats
 
 
+# Ollama health check runs once per process for each (endpoint, llm, embed) triple.
+_PREFLIGHT_DONE: set[tuple[str, str, str]] = set()
+
+
 def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> dict:
     t0 = time.time()
 
@@ -2999,13 +3252,16 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         model = t3.get("model", "qwen2.5:7b")
         endpoint = ollama_endpoint(cfg)
         embed_model = ((cfg.get("tier2") or {}).get("ollama") or {}).get("model") or "nomic-embed-text"
-        print(f"PREFLIGHT: endpoint={endpoint} llm={model} embed={embed_model}", flush=True)
-        try:
-            pf = preflight_ollama(endpoint=endpoint, llm_model=model, embed_model=embed_model)
-            print(f"PREFLIGHT_OK: {json.dumps({k: pf[k] for k in ('generate_ping','embed_dim','ok')})}", flush=True)
-        except PreflightError as e:
-            print(f"PREFLIGHT_FAILED: {e}", flush=True)
-            raise
+        pf_key = (endpoint, model, embed_model)
+        if pf_key not in _PREFLIGHT_DONE:
+            print(f"PREFLIGHT: endpoint={endpoint} llm={model} embed={embed_model}", flush=True)
+            try:
+                pf = preflight_ollama(endpoint=endpoint, llm_model=model, embed_model=embed_model)
+                print(f"PREFLIGHT_OK: {json.dumps({k: pf[k] for k in ('generate_ping','embed_dim','ok')})}", flush=True)
+            except PreflightError as e:
+                print(f"PREFLIGHT_FAILED: {e}", flush=True)
+                raise
+            _PREFLIGHT_DONE.add(pf_key)
 
     journal_path = resolve_path(cfg, cfg["io"]["decisions_out"])
     journal = DecisionJournal(journal_path)
@@ -3035,6 +3291,8 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         print(f"Mention hygiene: {hygiene_counts} (quarantined={len(quarantined)})", flush=True)
 
     by_id = {m["mention_id"]: m for m in mentions}
+    if (cfg.get("coparty_barrier") or {}).get("enabled"):
+        uf.enable_slots({mid: party_slot(m, cfg) for mid, m in by_id.items()})
 
     # Teach the name_gate which tokens in this pool are surnames and which are
     # docket prose, so it compares surnames rather than trailing noise.
@@ -3083,7 +3341,8 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
     if (cfg.get("ucid_anchor") or {}).get("enabled", True):
         res = resolve_short_mentions(mentions, cfg)
         for mg in res["merges"]:
-            uf.union(mg["anchor_id"], mg["short_id"])
+            if not uf.union(mg["anchor_id"], mg["short_id"]):
+                continue
             journal.log(
                 {
                     "decision_id": f"dec_{journal.n:08d}",
@@ -3146,13 +3405,24 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
     embed_pack = None
     if (cfg.get("tier2") or {}).get("enabled", True):
         backend = ((cfg.get("tier2") or {}).get("backend") or "ollama_faiss").lower()
-        if backend in {"ollama_faiss", "ollama", "faiss"}:
+        # Tier2 only pairs two different UF groups that share a block. If no
+        # block holds two groups, it cannot produce a pair: skip embedding.
+        tier2_possible = any(
+            len({uf.find(mid) for mid in mids}) >= 2 for mids in blocks.values()
+        )
+        if tier2_possible and backend in {"ollama_faiss", "ollama", "faiss"}:
             embed_pack = build_ollama_faiss_pack(mentions, cfg)
-        pairs = tier2_candidates(mentions, mention_blocks, blocks, uf, cfg, embed_pack=embed_pack)
+        pairs = (
+            tier2_candidates(mentions, mention_blocks, blocks, uf, cfg, embed_pack=embed_pack)
+            if tier2_possible
+            else []
+        )
         t2_out = apply_tier2_auto_merges(pairs, by_id, uf, cfg, journal, common_surnames)
         t2_stats = t2_out["stats"]
         t2_stats["candidate_pairs"] = len(pairs)
-        t2_stats["embedding_backend"] = (embed_pack or {}).get("backend", "rapidfuzz_fallback")
+        t2_stats["embedding_backend"] = (embed_pack or {}).get(
+            "backend", "rapidfuzz_fallback" if tier2_possible else "skipped_no_multi_group_block"
+        )
         ambiguous = t2_out["ambiguous"]
         # Marginal recall: pairs found by Tier2 that Tier0 had not merged
         reports = resolve_path(cfg, cfg["io"]["reports_dir"])
@@ -3221,10 +3491,28 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             "status": "OK",
         }
 
+    for a, b, why in uf.blocked:
+        journal.log(
+            {
+                "decision_id": f"dec_{journal.n:08d}",
+                "mention_id_a": a,
+                "mention_id_b": b,
+                "entity_type": cfg.get("entity_type"),
+                "decision": "NO_MATCH",
+                "confidence": 100,
+                "method": "barrier.coparty_same_case",
+                "rationale": "Different names listed as separate parties in the same case are different entities",
+                "signals": ["coparty_same_case"],
+                "evidence": {"ucid": why[0], "listed_name_a": why[1], "listed_name_b": why[2]},
+                "timestamp": _now(),
+                "config_version": cfg.get("version"),
+            }
+        )
     components = uf.components()
     elapsed = time.time() - t0
     summary = {
         "n_mentions": len(mentions),
+        "coparty_blocked": len(uf.blocked),
         "n_quarantined": len(quarantined),
         "n_entities_cascade": len(components),
         "n_entities": len(components) + len(quarantined),

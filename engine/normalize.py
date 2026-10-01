@@ -485,3 +485,69 @@ def year_from_date(date_str: str | None) -> int | None:
         return None
     m = re.search(r"(19|20)\d{2}", str(date_str))
     return int(m.group(0)) if m else None
+
+
+def _is_lower_word(tok: str) -> bool:
+    letters = [c for c in tok if c.isalpha()]
+    return bool(letters) and all(c.islower() for c in letters)
+
+
+def _is_name_word(tok: str) -> bool:
+    """Capitalized name word: first letter upper and at least one lower ("Garza", "McDonald")."""
+    letters = [c for c in tok if c.isalpha()]
+    return len(letters) >= 2 and letters[0].isupper() and any(c.islower() for c in letters)
+
+
+def _glued_caps_cut(tok: str, min_caps: int) -> int | None:
+    """Index where an all-caps run of >= min_caps runs into a capitalized word.
+
+    "ROBRENOSentencing" -> 7. "McDONALD", "DeMARCO", "MCDonald" -> None.
+    """
+    run = 0
+    for i, c in enumerate(tok):
+        if c.isupper():
+            run += 1
+            continue
+        if c.islower() and run > min_caps:
+            nxt = tok[i:]
+            if len([x for x in nxt if x.islower()]) >= 2:
+                return i - 1
+        run = 0
+    return None
+
+
+def clean_name_span(raw: str, rules: dict | None) -> str:
+    """Remove docket prose glued to a person name. General rules, no word lists.
+
+    rules (config normalization.name_cleaning):
+      cut_at_chars: characters that end the name (e.g. ":")
+      split_glued_caps_min: all-caps run length that marks a glued word (e.g. 3)
+      cut_lowercase_after_tokens: cut at the first all-lowercase word after this
+        many words, unless a capitalized name word follows it ("de la Garza")
+    Names with no uppercase letter at all are returned unchanged.
+    """
+    if not rules or not rules.get("enabled", True) or not raw:
+        return raw
+    s = raw
+    for ch in rules.get("cut_at_chars") or []:
+        if ch and ch in s:
+            s = s.split(ch, 1)[0]
+    if not any(c.isupper() for c in s):
+        return raw.strip() if s == raw else s.strip()
+    toks = s.split()
+    min_caps = rules.get("split_glued_caps_min")
+    if min_caps:
+        for i, t in enumerate(toks):
+            cut = _glued_caps_cut(t, int(min_caps))
+            if cut is not None:
+                toks = toks[:i] + [t[:cut]]
+                break
+    after = rules.get("cut_lowercase_after_tokens")
+    if after:
+        after = int(after)
+        for i in range(after, len(toks)):
+            if _is_lower_word(toks[i]) and not any(_is_name_word(t) for t in toks[i + 1 :]):
+                toks = toks[:i]
+                break
+    out = " ".join(toks).strip(" ,;-")
+    return out or raw
