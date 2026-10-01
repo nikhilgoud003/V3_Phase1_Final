@@ -34,7 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from engine.cluster import cluster_mentions  # noqa: E402
-from engine.config_loader import load_config, resolve_path  # noqa: E402
+from engine.config_loader import load_config, load_config_cached, resolve_path  # noqa: E402
+from engine.embeddings import EMBED_STATS  # noqa: E402
 from engine.discovery_validity import (  # noqa: E402
     force_type_other,
     path_is_non_entity,
@@ -711,6 +712,12 @@ def main() -> int:
         "Use --fresh to start over.",
     )
     ap.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Also save the checkpoint every N files (default 0: save once at the end).",
+    )
+    ap.add_argument(
         "--fresh",
         action="store_true",
         help="Start from file 1. Refuses if --output-dir already contains any file.",
@@ -795,8 +802,10 @@ def main() -> int:
             "poc_evidence": [],
             "cascade_last": {},
         }
+    inc.RUN_CACHE_DIR = out_root / "checkpoint"
     embed_cache = inc.EmbedCache(out_root / "checkpoint" / "embed_cache.json")
     state["embed_cache"] = embed_cache
+    saved_index = {et: inc.SavedIndex() for et in ("judge", "firm", "party")}
     processed_keys = {(p["file"], p["sha256"]) for p in state["processed"]}
     prefixes = {
         et: (cfgs[et].get("clustering") or {}).get("id_prefix", "SJ")
@@ -877,7 +886,7 @@ def main() -> int:
                 resolved = inc.resolve_within_file(
                     file_mentions[etype], file_xfers[etype], cfgs[etype], work_dir
                 )
-                cfg = load_config(cfg_path)
+                cfg = load_config_cached(cfg_path)
                 journal = link_journal
                 saved, fresh, link_stats = inc.link_against_saved(
                     resolved["entities"],
@@ -886,6 +895,7 @@ def main() -> int:
                     cfg,
                     embed_cache,
                     journal,
+                    saved_index[etype],
                 )
                 fresh, state["next_serial"][etype] = inc.stamp_new_entities(
                     fresh, resolved["by_id"], prefixes[etype], state["next_serial"][etype]
@@ -945,7 +955,8 @@ def main() -> int:
                 "processed_files": len(state["processed"]),
                 "timings": state["timings"],
             }
-            inc.save_checkpoint(out_root, state)
+            if args.checkpoint_every and len(state["processed"]) % args.checkpoint_every == 0:
+                inc.save_checkpoint(out_root, state)
             timing["sec_write"] = round(time.perf_counter() - t_write, 3)
             print(
                 f"FILE_SEC step={step_i} file={fp.name} sec={timing['sec_total']:.3f} "
@@ -955,6 +966,16 @@ def main() -> int:
             )
             print(f"CHECKPOINT file_done={step_i} name={fp.name}", flush=True)
 
+        # One checkpoint save for the whole run (IDs and serials for later files).
+        state["summary_partial"] = {
+            "output_dir": str(out_root),
+            "incremental": True,
+            "processed_files": len(state["processed"]),
+            "timings": state["timings"],
+        }
+        t_ck = time.perf_counter()
+        inc.save_checkpoint(out_root, state)
+        print(f"CHECKPOINT saved once: {len(state['processed'])} files in {time.perf_counter() - t_ck:.2f}s", flush=True)
         final_entities = state["entities"]
         final_mentions = state["mentions"]
         final_by_id = {}
@@ -991,6 +1012,7 @@ def main() -> int:
                 for etype in ("judge", "firm", "party")
             },
             "cross_file_entities": cross_final,
+            "embedding_calls": dict(EMBED_STATS),
             "per_file_cumulative": step_summaries,
             "cascade_final": final_cascade,
             "poc_party_evidence": poc_evidence_all,

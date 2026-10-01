@@ -28,6 +28,7 @@ from .normalize import first_last_initials, initial_token_ratio, is_initial_toke
 from .preflight import CascadeFailedError, PreflightError, check_tier3_error_rate, preflight_ollama
 from .tier3_citation import apply_citation_and_match_rails
 from .provenance import DecisionJournal, append_jsonl
+from .run_cache import file_memo
 
 
 def prompt_sha256(text: str) -> str:
@@ -258,6 +259,7 @@ def build_token_profile_for_run(mentions: list[dict], cfg: dict) -> dict:
     return build_token_profile(mentions, fjc_surnames, min_occurrences=min_occ)
 
 
+@file_memo
 def load_common_surnames(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -2990,6 +2992,10 @@ def tier3_adjudicate(
     return stats
 
 
+# Ollama health check runs once per process for each (endpoint, llm, embed) triple.
+_PREFLIGHT_DONE: set[tuple[str, str, str]] = set()
+
+
 def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> dict:
     t0 = time.time()
 
@@ -2999,13 +3005,16 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         model = t3.get("model", "qwen2.5:7b")
         endpoint = ollama_endpoint(cfg)
         embed_model = ((cfg.get("tier2") or {}).get("ollama") or {}).get("model") or "nomic-embed-text"
-        print(f"PREFLIGHT: endpoint={endpoint} llm={model} embed={embed_model}", flush=True)
-        try:
-            pf = preflight_ollama(endpoint=endpoint, llm_model=model, embed_model=embed_model)
-            print(f"PREFLIGHT_OK: {json.dumps({k: pf[k] for k in ('generate_ping','embed_dim','ok')})}", flush=True)
-        except PreflightError as e:
-            print(f"PREFLIGHT_FAILED: {e}", flush=True)
-            raise
+        pf_key = (endpoint, model, embed_model)
+        if pf_key not in _PREFLIGHT_DONE:
+            print(f"PREFLIGHT: endpoint={endpoint} llm={model} embed={embed_model}", flush=True)
+            try:
+                pf = preflight_ollama(endpoint=endpoint, llm_model=model, embed_model=embed_model)
+                print(f"PREFLIGHT_OK: {json.dumps({k: pf[k] for k in ('generate_ping','embed_dim','ok')})}", flush=True)
+            except PreflightError as e:
+                print(f"PREFLIGHT_FAILED: {e}", flush=True)
+                raise
+            _PREFLIGHT_DONE.add(pf_key)
 
     journal_path = resolve_path(cfg, cfg["io"]["decisions_out"])
     journal = DecisionJournal(journal_path)
@@ -3146,13 +3155,24 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
     embed_pack = None
     if (cfg.get("tier2") or {}).get("enabled", True):
         backend = ((cfg.get("tier2") or {}).get("backend") or "ollama_faiss").lower()
-        if backend in {"ollama_faiss", "ollama", "faiss"}:
+        # Tier2 only pairs two different UF groups that share a block. If no
+        # block holds two groups, it cannot produce a pair: skip embedding.
+        tier2_possible = any(
+            len({uf.find(mid) for mid in mids}) >= 2 for mids in blocks.values()
+        )
+        if tier2_possible and backend in {"ollama_faiss", "ollama", "faiss"}:
             embed_pack = build_ollama_faiss_pack(mentions, cfg)
-        pairs = tier2_candidates(mentions, mention_blocks, blocks, uf, cfg, embed_pack=embed_pack)
+        pairs = (
+            tier2_candidates(mentions, mention_blocks, blocks, uf, cfg, embed_pack=embed_pack)
+            if tier2_possible
+            else []
+        )
         t2_out = apply_tier2_auto_merges(pairs, by_id, uf, cfg, journal, common_surnames)
         t2_stats = t2_out["stats"]
         t2_stats["candidate_pairs"] = len(pairs)
-        t2_stats["embedding_backend"] = (embed_pack or {}).get("backend", "rapidfuzz_fallback")
+        t2_stats["embedding_backend"] = (embed_pack or {}).get(
+            "backend", "rapidfuzz_fallback" if tier2_possible else "skipped_no_multi_group_block"
+        )
         ambiguous = t2_out["ambiguous"]
         # Marginal recall: pairs found by Tier2 that Tier0 had not merged
         reports = resolve_path(cfg, cfg["io"]["reports_dir"])

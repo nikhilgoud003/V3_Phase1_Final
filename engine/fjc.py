@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .normalize import normalize_name, tokens
+from .run_cache import file_memo
 
 
 def load_court_crosswalk(path: Path) -> dict[str, str]:
@@ -86,6 +87,7 @@ def _index_add(index: dict, key, nid: str) -> None:
     index.setdefault(key, set()).add(nid)
 
 
+@file_memo
 def load_fjc_index(
     fjc_csv: Path,
     crosswalk_path: Path,

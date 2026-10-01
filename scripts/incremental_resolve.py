@@ -15,15 +15,16 @@ import hashlib
 import json
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from engine.cluster import cluster_mentions
-from engine.embeddings import compact_embed_text, embed_texts_ollama
+from engine.embeddings import cached_vectors, compact_embed_text, embed_texts_ollama, seed_vector_cache
 from engine.poc_party_evidence import adjudicate_poc_evidence_via_tier3, rebuild_components
-from engine.config_loader import load_config, ollama_endpoint, resolve_path
+from engine.config_loader import load_config_cached, ollama_endpoint, resolve_path
 from engine.provenance import DecisionJournal
 from engine.tiers import (
     UnionFind,
@@ -44,7 +45,21 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+_ALIAS_CACHE: dict[str, dict[str, str]] = {}
+_SURNAME_CACHE: dict[str, set[str]] = {}
+
+# Set by the driver: run-wide cache folder that survives the per-file work_dir wipe.
+RUN_CACHE_DIR: Path | None = None
+
+
 def _alias_index(cfg: dict) -> dict[str, str]:
+    key = str(cfg.get("_config_path"))
+    if key not in _ALIAS_CACHE:
+        _ALIAS_CACHE[key] = _alias_index_uncached(cfg)
+    return _ALIAS_CACHE[key]
+
+
+def _alias_index_uncached(cfg: dict) -> dict[str, str]:
     out: dict[str, str] = {}
     for grp in (cfg.get("tier0") or {}).get("alias_groups") or []:
         gid = str(grp.get("id") or "alias")
@@ -56,6 +71,13 @@ def _alias_index(cfg: dict) -> dict[str, str]:
 
 
 def _common_surnames(cfg: dict) -> set[str]:
+    key = str(cfg.get("_config_path"))
+    if key not in _SURNAME_CACHE:
+        _SURNAME_CACHE[key] = _common_surnames_uncached(cfg)
+    return _SURNAME_CACHE[key]
+
+
+def _common_surnames_uncached(cfg: dict) -> set[str]:
     path = None
     for trig in (cfg.get("information_content_barrier") or {}).get("triggers") or []:
         if trig.get("id") == "very_common_surname" and trig.get("list_path"):
@@ -67,40 +89,39 @@ def _common_surnames(cfg: dict) -> set[str]:
 
 
 class EmbedCache:
-    """Same profile string is embedded once and reused from disk."""
+    """Disk copy of the process-wide vector cache (engine.embeddings).
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.mem: dict[str, np.ndarray] = {}
-        if path.is_file():
-            with path.open("rb") as f:
-                blob = f.read()
-            if blob:
-                payload = json.loads(blob.decode("utf-8"))
-                for key, vec in payload.items():
-                    self.mem[key] = np.asarray(vec, dtype=np.float32)
+    Loaded once at start and saved once at the end, so a later run that adds
+    files does not re-embed names it has already seen.
+    """
+
+    def __init__(self, path: Path, model: str = "nomic-embed-text") -> None:
+        self.path = path.with_suffix(".npz")
+        self.model = model
+        legacy = path.with_suffix(".json")
+        if self.path.is_file():
+            with np.load(self.path, allow_pickle=False) as z:
+                seed_vector_cache(model, dict(zip(z["texts"].tolist(), z["vectors"])))
+        elif legacy.is_file() and legacy.stat().st_size:
+            payload = json.loads(legacy.read_text(encoding="utf-8"))
+            seed_vector_cache(model, {k: np.asarray(v, dtype=np.float32) for k, v in payload.items()})
 
     def save(self) -> None:
+        vecs = cached_vectors(self.model)
+        if not vecs:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {k: v.tolist() for k, v in self.mem.items()}
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        texts = list(vecs)
+        tmp = self.path.with_name(self.path.stem + ".tmp.npz")
+        np.savez(tmp, texts=np.asarray(texts), vectors=np.vstack([vecs[t] for t in texts]))
         os.replace(tmp, self.path)
 
     def vectors_for(self, mentions: list[dict], cfg: dict) -> dict[str, np.ndarray]:
         texts = {m["mention_id"]: compact_embed_text(m) for m in mentions}
-        missing = []
-        seen = set()
-        for t in texts.values():
-            if t not in self.mem and t not in seen:
-                seen.add(t)
-                missing.append(t)
-        if missing:
-            model = (cfg.get("tier2") or {}).get("ollama_embed_model") or "nomic-embed-text"
-            mat = embed_texts_ollama(missing, model=model, endpoint=ollama_endpoint(cfg))
-            for t, row in zip(missing, mat):
-                self.mem[t] = np.asarray(row, dtype=np.float32)
-        return {mid: self.mem[t] for mid, t in texts.items()}
+        model = (cfg.get("tier2") or {}).get("ollama_embed_model") or "nomic-embed-text"
+        order = list(texts)
+        mat = embed_texts_ollama([texts[mid] for mid in order], model=model, endpoint=ollama_endpoint(cfg))
+        return {mid: mat[i] for i, mid in enumerate(order)}
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -214,28 +235,51 @@ def _absorb(entity: dict, new_entity: dict, new_mentions: list[dict]) -> None:
     entity["fjc_nids"] = sorted(nids)
 
 
-def _candidates(saved: list[dict], new_mentions: list[dict], cfg: dict) -> list[dict]:
-    if not saved:
-        return []
-    alias = _alias_index(cfg)
-    blocks = build_profile_blocks(new_mentions + [_proto(e, {}) for e in saved if e.get("_proto")], cfg)
-    want: set[str] = set()
-    for m in new_mentions:
-        for k in blocks.get(m["mention_id"]) or []:
-            want.add(k)
-    new_alias = {alias.get(" ".join((m.get("normalized_name") or "").lower().split())) for m in new_mentions}
-    new_alias.discard(None)
-    out = []
-    for e in saved:
-        proto = e.get("_proto") or {}
-        gid = alias.get(" ".join((proto.get("normalized_name") or e.get("normalized_name") or "").lower().split()))
-        if gid and gid in new_alias:
-            out.append(e)
-            continue
-        keys = set(blocks.get(proto.get("mention_id") or "") or [])
-        if keys & want:
-            out.append(e)
-    return out
+class SavedIndex:
+    """Lookup table from block key / alias group to saved entities.
+
+    Replaces re-blocking every saved prototype for every new entity. The
+    saved list only grows by appending, so entity positions are stable and
+    candidates come back in the same (saved-list) order as before.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.by_block: dict[str, list[int]] = defaultdict(list)
+        self.by_alias: dict[str, list[int]] = defaultdict(list)
+
+    def sync(self, saved: list[dict], cfg: dict) -> None:
+        if self.n >= len(saved):
+            return
+        alias = _alias_index(cfg)
+        new = saved[self.n :]
+        protos = [e.get("_proto") or {} for e in new]
+        blocks = build_profile_blocks([p for p in protos if p.get("mention_id")], cfg)
+        for i, (e, proto) in enumerate(zip(new, protos), start=self.n):
+            gid = alias.get(" ".join((proto.get("normalized_name") or e.get("normalized_name") or "").lower().split()))
+            if gid:
+                self.by_alias[gid].append(i)
+            if not e.get("_proto"):
+                continue
+            for k in blocks.get(proto.get("mention_id") or "") or []:
+                self.by_block[k].append(i)
+        self.n = len(saved)
+
+    def candidates(self, saved: list[dict], new_mentions: list[dict], cfg: dict) -> list[dict]:
+        if not saved:
+            return []
+        self.sync(saved, cfg)
+        alias = _alias_index(cfg)
+        hit: set[int] = set()
+        for m in new_mentions:
+            gid = alias.get(" ".join((m.get("normalized_name") or "").lower().split()))
+            if gid:
+                hit.update(self.by_alias.get(gid) or ())
+        blocks = build_profile_blocks(new_mentions, cfg)
+        for m in new_mentions:
+            for k in blocks.get(m["mention_id"]) or []:
+                hit.update(self.by_block.get(k) or ())
+        return [saved[i] for i in sorted(hit)]
 
 
 def link_against_saved(
@@ -245,6 +289,7 @@ def link_against_saved(
     cfg: dict,
     embed_cache: EmbedCache,
     journal: DecisionJournal,
+    index: SavedIndex | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Attach each new entity to one saved entity, or return it as new.
 
@@ -255,6 +300,8 @@ def link_against_saved(
     alias = _alias_index(cfg)
     surnames = _common_surnames(cfg)
     min_sim = float(((cfg.get("tier2") or {}).get("search") or {}).get("min_similarity", 0.72))
+    if index is None:
+        index = SavedIndex()
 
     for ent in new_entities:
         members = [by_id[mid] for mid in (ent.get("mention_ids") or []) if mid in by_id]
@@ -262,7 +309,7 @@ def link_against_saved(
             still_new.append(ent)
             stats["new"] += 1
             continue
-        cands = _candidates(saved, members, cfg)
+        cands = index.candidates(saved, members, cfg)
         if not cands:
             still_new.append(ent)
             stats["new"] += 1
@@ -374,7 +421,11 @@ def resolve_within_file(mentions: list[dict], transfers: list[dict], cfg: dict, 
     from engine.extract import _finalize_mentions
 
     os.environ["TIER_V3_OUTPUT_DIR"] = str(work_dir)
-    cfg = load_config(cfg["_config_path"])
+    cfg = load_config_cached(cfg["_config_path"])
+    if RUN_CACHE_DIR is not None:
+        llm_nv = (cfg.get("name_validity") or {}).get("llm_validation")
+        if isinstance(llm_nv, dict):
+            llm_nv["cache_path"] = str(RUN_CACHE_DIR / "llm_name_validity_cache.jsonl")
     finalized = _finalize_mentions(
         cfg,
         list(mentions),

@@ -20,6 +20,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from engine.run_cache import file_memo
+
 DEFAULT_GENERATIONAL_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "esq", "esquire"}
 
 # Trailing fragments often glued by NER after a real name
@@ -202,6 +204,7 @@ def load_english_wordlist(path: str | None = None) -> frozenset[str]:
     )
 
 
+@file_memo
 def load_fjc_name_sets(
     fjc_csv: Path,
     honorifics: list[str],

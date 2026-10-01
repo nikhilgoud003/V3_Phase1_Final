@@ -103,6 +103,31 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     return apply_runtime_overrides(cfg)
 
 
+_ENV_KEYS = (
+    "OLLAMA_HOST",
+    "OLLAMA_ENDPOINT",
+    "TIER_V3_LLM_MODEL",
+    "TIER_V3_TIER2_BACKEND",
+    "TIER_V3_JSON_DIR",
+    "TIER_V3_DATA_DIR",
+    "TIER_V3_OUTPUT_DIR",
+)
+_CFG_CACHE: dict[tuple, dict[str, Any]] = {}
+
+
+def load_config_cached(config_path: str | Path) -> dict[str, Any]:
+    """Same result as load_config, but the YAML is parsed once per path and env.
+
+    Returns a deep copy, so callers may mutate it freely.
+    """
+    import copy
+
+    key = (str(config_path),) + tuple(os.environ.get(k) for k in _ENV_KEYS)
+    if key not in _CFG_CACHE:
+        _CFG_CACHE[key] = load_config(config_path)
+    return copy.deepcopy(_CFG_CACHE[key])
+
+
 def resolve_path(cfg: dict[str, Any], rel: str) -> Path:
     """Resolve a config-relative path with optional DATA/OUTPUT env remapping."""
     p = Path(rel)

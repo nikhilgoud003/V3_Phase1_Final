@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -34,31 +35,81 @@ def configure_faiss_threads(faiss_mod) -> int:
     return n
 
 
+# Process-wide vector cache: (model, text) -> L2-normalized float32 vector.
+# The same text is embedded at most once per run, whichever tier asks for it.
+_VEC_CACHE: dict[tuple[str, str], np.ndarray] = {}
+EMBED_STATS = {"requests": 0, "texts_embedded": 0, "cache_hits": 0}
+
+
+def cached_vectors(model: str) -> dict[str, np.ndarray]:
+    return {t: v for (m, t), v in _VEC_CACHE.items() if m == model}
+
+
+def seed_vector_cache(model: str, vectors: dict[str, np.ndarray]) -> None:
+    for t, v in vectors.items():
+        _VEC_CACHE[(model, t)] = np.asarray(v, dtype=np.float32)
+
+
+def _l2(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return mat / norms
+
+
+def _post(url: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _embed_uncached(texts: list[str], model: str, endpoint: str, batch_size: int) -> np.ndarray:
+    base = endpoint.rstrip("/")
+    rows: list[np.ndarray] = []
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i : i + batch_size]
+        try:
+            body = _post(f"{base}/api/embed", {"model": model, "input": chunk})
+            vecs = body["embeddings"]
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            # Older Ollama without /api/embed: one request per text.
+            vecs = [_post(f"{base}/api/embeddings", {"model": model, "prompt": t})["embedding"] for t in chunk]
+            EMBED_STATS["requests"] += len(chunk) - 1
+        EMBED_STATS["requests"] += 1
+        rows.append(np.asarray(vecs, dtype=np.float32))
+    return _l2(np.vstack(rows))
+
+
 def embed_texts_ollama(
     texts: list[str],
     *,
     model: str = "nomic-embed-text",
     endpoint: str = "http://localhost:11434",
     batch_log_every: int = 500,
+    batch_size: int = 128,
 ) -> np.ndarray:
-    """Embed texts via Ollama /api/embeddings. Returns float32 matrix (n, d), L2-normalized."""
-    vectors = []
-    url = f"{endpoint.rstrip('/')}/api/embeddings"
-    for i, text in enumerate(texts):
-        payload = json.dumps({"model": model, "prompt": text}).encode()
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = json.loads(resp.read().decode())
-        vec = np.asarray(body["embedding"], dtype=np.float32)
-        vectors.append(vec)
-        if batch_log_every and (i + 1) % batch_log_every == 0:
-            print(f"  embedded {i+1}/{len(texts)}")
-    mat = np.vstack(vectors)
-    # L2 normalize for cosine via inner product
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    mat = mat / norms
-    return mat
+    """Embed texts via Ollama (batched /api/embed). Returns float32 matrix (n, d), L2-normalized.
+
+    Vectors are cached per process, so repeated texts cost no request.
+    """
+    missing: list[str] = []
+    seen: set[str] = set()
+    for t in texts:
+        if (model, t) not in _VEC_CACHE and t not in seen:
+            seen.add(t)
+            missing.append(t)
+    EMBED_STATS["cache_hits"] += len(texts) - len(missing)
+    if missing:
+        mat = _embed_uncached(missing, model, endpoint, batch_size)
+        for t, row in zip(missing, mat):
+            _VEC_CACHE[(model, t)] = row
+        EMBED_STATS["texts_embedded"] += len(missing)
+        if batch_log_every and len(missing) >= batch_log_every:
+            print(f"  embedded {len(missing)} new texts")
+    return np.vstack([_VEC_CACHE[(model, t)] for t in texts]).astype(np.float32)
 
 
 def build_faiss_ip_index(vectors: np.ndarray):
