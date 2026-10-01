@@ -3264,7 +3264,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             _PREFLIGHT_DONE.add(pf_key)
 
     journal_path = resolve_path(cfg, cfg["io"]["decisions_out"])
-    journal = DecisionJournal(journal_path)
+    journal = DecisionJournal(journal_path, buffered=True)
     uf = UnionFind()
 
     common_path = resolve_path(
@@ -3464,6 +3464,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
                 "elapsed_sec": round(elapsed, 2),
             }
             print("CASCADE status=FAILED — do not report entity counts as baseline.", flush=True)
+            journal.flush()
             return {
                 "uf": uf,
                 "components": uf.components(),
@@ -3526,6 +3527,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         "llm_mention_fraction": t3_stats.get("llm_mention_fraction"),
         "mention_hygiene": hygiene_counts,
     }
+    journal.flush()
     return {
         "uf": uf,
         "components": components,

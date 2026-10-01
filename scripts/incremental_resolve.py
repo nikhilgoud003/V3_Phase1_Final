@@ -255,6 +255,8 @@ class SavedIndex:
         self.pos: dict[int, int] = {}
         # Saved mentions by id (filled by the driver), for the co-party barrier.
         self.mentions: dict[str, dict] = {}
+        # Per-entity co-party slots, built once and updated on absorb.
+        self.slot_cache: dict[int, set] = {}
 
     def sync(self, saved: list[dict], cfg: dict) -> None:
         if self.n >= len(saved):
@@ -276,13 +278,32 @@ class SavedIndex:
                 self.by_block[k].append(i)
         self.n = len(saved)
 
-    def note_absorb(self, entity: dict) -> None:
-        """Index FJC ids a saved entity gained by absorbing a new one."""
+    def note_absorb(self, entity: dict, members: list[dict] | None = None, cfg: dict | None = None) -> None:
+        """Index FJC ids and co-party slots a saved entity gained by absorbing a new one."""
         i = self.pos.get(id(entity))
         if i is None:
             return
         for nid in entity.get("fjc_nids") or []:
             self.by_nid[str(nid)].add(i)
+        if i in self.slot_cache and members and cfg is not None:
+            for m in members:
+                slot = party_slot(m, cfg)
+                if slot:
+                    self.slot_cache[i].add(slot)
+
+    def entity_slots(self, entity: dict, by_id: dict, cfg: dict) -> set:
+        i = self.pos.get(id(entity))
+        if i is not None and i in self.slot_cache:
+            return self.slot_cache[i]
+        slots = set()
+        for mid in entity.get("mention_ids") or []:
+            m = self.mentions.get(mid) or by_id.get(mid)
+            slot = party_slot(m, cfg) if m else None
+            if slot:
+                slots.add(slot)
+        if i is not None:
+            self.slot_cache[i] = slots
+        return slots
 
     def fjc_hits(self, saved: list[dict], nids: set[str], cfg: dict) -> list[dict]:
         self.sync(saved, cfg)
@@ -312,14 +333,65 @@ def _coparty_ok(entity: dict, members: list[dict], index: SavedIndex, by_id: dic
     """False when linking would put two separately listed co-parties of one case together."""
     if not (cfg.get("coparty_barrier") or {}).get("enabled"):
         return True
-    slots_e = set()
-    for mid in entity.get("mention_ids") or []:
-        m = index.mentions.get(mid) or by_id.get(mid)
-        slot = party_slot(m, cfg) if m else None
-        if slot:
-            slots_e.add(slot)
+    slots_e = index.entity_slots(entity, by_id, cfg)
     slots_n = {s for s in (party_slot(m, cfg) for m in members) if s}
     return coparty_conflict(slots_e, slots_n) is None
+
+
+class _ScratchJournal:
+    """Collects the comparison rows made while linking one new entity.
+
+    Only the outcome (and any LLM decision) is written to the link log, so the
+    log grows by one row per decision instead of one row per comparison.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.rows: list[dict] = []
+
+    def log(self, record: dict) -> None:
+        self.n += 1
+        record.setdefault("decision_id", f"cmp_{self.n:08d}")
+        self.rows.append(record)
+
+
+def _log_link(
+    journal: DecisionJournal,
+    *,
+    decision: str,
+    method: str,
+    rationale: str,
+    members: list[dict],
+    chosen: dict | None,
+    n_candidates: int,
+    scratch: _ScratchJournal | None,
+    cfg: dict,
+    signals: list[str],
+) -> None:
+    compared: dict[str, int] = defaultdict(int)
+    if scratch is not None:
+        for r in scratch.rows:
+            if str(r.get("method") or "").startswith("tier3.ollama"):
+                journal.log(dict(r))  # LLM decisions are kept as they are
+            compared[f"{r.get('method')}:{r.get('decision')}"] += 1
+    journal.log(
+        {
+            "decision": decision,
+            "method": method,
+            "mention_id_a": members[0]["mention_id"],
+            "mention_id_b": (chosen.get("_proto") or {}).get("mention_id") if chosen else None,
+            "entity_type": cfg.get("entity_type"),
+            "confidence": 100,
+            "rationale": rationale,
+            "signals": signals,
+            "evidence": {
+                "linked_sjid": chosen.get("sjid") if chosen else None,
+                "n_candidates": n_candidates,
+                "comparisons": dict(compared),
+            },
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    )
 
 
 def link_against_saved(
@@ -357,20 +429,13 @@ def link_against_saved(
             if nid_hits:
                 chosen = sorted(nid_hits, key=lambda h: str(h.get("sjid") or ""))[0]
                 _absorb(chosen, ent, members)
-                index.note_absorb(chosen)
+                index.note_absorb(chosen, members, cfg)
                 stats["fjc_links"] += 1
-                journal.log(
-                    {
-                        "decision": "MERGE_TIER0",
-                        "method": "incremental.link_fjc_nid",
-                        "mention_id_a": members[0]["mention_id"],
-                        "mention_id_b": (chosen.get("_proto") or {}).get("mention_id"),
-                        "entity_type": cfg.get("entity_type"),
-                        "confidence": 100,
-                        "rationale": f"Same FJC id {sorted(nids & set(map(str, chosen.get('fjc_nids') or [])))} as saved {chosen.get('sjid')}",
-                        "signals": ["incremental", "fjc_nid_match"],
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    }
+                _log_link(
+                    journal, decision="MERGE_TIER0", method="incremental.link_fjc_nid",
+                    rationale=f"Same FJC id {sorted(nids & set(map(str, chosen.get('fjc_nids') or [])))} as saved {chosen.get('sjid')}",
+                    members=members, chosen=chosen, n_candidates=len(nid_hits), scratch=None, cfg=cfg,
+                    signals=["incremental", "fjc_nid_match"],
                 )
                 continue
         cands = index.candidates(saved, members, cfg)
@@ -379,8 +444,14 @@ def link_against_saved(
         if not cands:
             still_new.append(ent)
             stats["new"] += 1
+            _log_link(
+                journal, decision="NEW_ENTITY", method="incremental.new_entity",
+                rationale="No saved entity shares a block, alias group or FJC id",
+                members=members, chosen=None, n_candidates=0, scratch=None, cfg=cfg, signals=["incremental", "no_candidates"],
+            )
             continue
 
+        scratch = _ScratchJournal()
         pool = members + [c["_proto"] for c in cands if c.get("_proto")]
         uf = UnionFind()
         # Keep the within-file entity as one blob. Tier0 may then union it with
@@ -390,7 +461,7 @@ def link_against_saved(
             uf.add(m["mention_id"])
         for m in members[1:]:
             uf.union(members[0]["mention_id"], m["mention_id"])
-        tier0_merge_groups(pool, cfg, journal, uf)
+        tier0_merge_groups(pool, cfg, scratch, uf)
         root_new = uf.find(members[0]["mention_id"])
         hits = []
         for c in cands:
@@ -401,20 +472,13 @@ def link_against_saved(
         if hits:
             chosen = _pick_hit(hits, ent)
             _absorb(chosen, ent, members)
-            index.note_absorb(chosen)
+            index.note_absorb(chosen, members, cfg)
             stats["tier0_links"] += 1
-            journal.log(
-                {
-                    "decision": "MERGE_TIER0",
-                    "method": "incremental.link_tier0",
-                    "mention_id_a": members[0]["mention_id"],
-                    "mention_id_b": (chosen.get("_proto") or {}).get("mention_id"),
-                    "entity_type": cfg.get("entity_type"),
-                    "confidence": 100,
-                    "rationale": f"New file linked to saved {chosen.get('sjid')} by existing Tier0 rules",
-                    "signals": ["incremental", "tier0"],
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
+            _log_link(
+                journal, decision="MERGE_TIER0", method="incremental.link_tier0",
+                rationale=f"New file linked to saved {chosen.get('sjid')} by existing Tier0 rules",
+                members=members, chosen=chosen, n_candidates=len(cands), scratch=scratch, cfg=cfg,
+                signals=["incremental", "tier0"],
             )
             continue
 
@@ -438,7 +502,7 @@ def link_against_saved(
         uf2 = UnionFind()
         for m in by.values():
             uf2.add(m["mention_id"])
-        t2 = apply_tier2_auto_merges(pairs, by, uf2, cfg, journal, surnames)
+        t2 = apply_tier2_auto_merges(pairs, by, uf2, cfg, scratch, surnames)
         linked = None
         for c in cands:
             pid = (c.get("_proto") or {}).get("mention_id")
@@ -450,14 +514,20 @@ def link_against_saved(
             stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
         if linked is not None:
             _absorb(linked, ent, members)
-            index.note_absorb(linked)
+            index.note_absorb(linked, members, cfg)
             stats["tier2_links"] += 1
+            _log_link(
+                journal, decision="MERGE_TIER2", method="incremental.link_tier2",
+                rationale=f"New file linked to saved {linked.get('sjid')} by Tier2 embedding similarity",
+                members=members, chosen=linked, n_candidates=len(cands), scratch=scratch, cfg=cfg,
+                signals=["incremental", "tier2"],
+            )
             continue
         ambiguous = [p for p in (t2.get("ambiguous") or []) if proto_new["mention_id"] in (p[0], p[1])]
         if ambiguous:
             blocks = build_profile_blocks(list(by.values()), cfg)
             t3 = tier3_adjudicate(
-                ambiguous, by, uf2, cfg, journal, blocks, total_mentions=len(by)
+                ambiguous, by, uf2, cfg, scratch, blocks, total_mentions=len(by)
             )
             stats["tier3_calls"] += int(t3.get("llm_calls") or 0)
             for c in cands:
@@ -470,11 +540,23 @@ def link_against_saved(
                 stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
             if linked is not None:
                 _absorb(linked, ent, members)
-                index.note_absorb(linked)
+                index.note_absorb(linked, members, cfg)
                 stats["tier3_links"] += 1
+                _log_link(
+                    journal, decision="MERGE_TIER3", method="incremental.link_tier3",
+                    rationale=f"New file linked to saved {linked.get('sjid')} by Tier3 (LLM)",
+                    members=members, chosen=linked, n_candidates=len(cands), scratch=scratch, cfg=cfg,
+                    signals=["incremental", "tier3"],
+                )
                 continue
         still_new.append(ent)
         stats["new"] += 1
+        _log_link(
+            journal, decision="NEW_ENTITY", method="incremental.new_entity",
+            rationale="No saved candidate matched (Tier0/Tier2/Tier3)",
+            members=members, chosen=None, n_candidates=len(cands), scratch=scratch, cfg=cfg,
+            signals=["incremental", "no_match"],
+        )
     return saved, still_new, stats
 
 
@@ -516,10 +598,13 @@ def resolve_within_file(mentions: list[dict], transfers: list[dict], cfg: dict, 
     by_id = result["by_id"]
     poc: dict[str, Any] = {}
     if cfg.get("entity_type") == "party":
-        journal = DecisionJournal(work_dir / "decisions" / "poc_party_evidence_decisions.jsonl", fresh=True)
+        journal = DecisionJournal(
+            work_dir / "decisions" / "poc_party_evidence_decisions.jsonl", fresh=True, buffered=True
+        )
         poc_stats = adjudicate_poc_evidence_via_tier3(
             finalized, uf, cfg, journal=journal, max_pairs=25
         )
+        journal.flush()
         if poc_stats["merges"]:
             comps = rebuild_components(uf, [m["mention_id"] for m in finalized])
             entities = cluster_mentions(comps, by_id, cfg, uf)

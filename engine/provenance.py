@@ -18,8 +18,20 @@ def _fsync_file(f) -> None:
 
 
 class DecisionJournal:
-    def __init__(self, path: str | Path, *, fresh: bool = True) -> None:
+    """Append-only decision log.
+
+    buffered=True keeps rows in memory and writes them with one fsync per
+    flush() (or every flush_every rows) instead of one open+fsync per row.
+    The caller must flush() before anything reads the file.
+    """
+
+    def __init__(
+        self, path: str | Path, *, fresh: bool = True, buffered: bool = False, flush_every: int = 5000
+    ) -> None:
         self.path = Path(path)
+        self.buffered = buffered
+        self.flush_every = flush_every
+        self._buf: list[str] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if fresh:
             # Truncate for a new cascade run (caller should point elsewhere if
@@ -39,9 +51,22 @@ class DecisionJournal:
         if "decision_id" not in record:
             record["decision_id"] = f"dec_{self.n:08d}"
         line = json.dumps(record, ensure_ascii=False) + "\n"
+        if self.buffered:
+            self._buf.append(line)
+            if len(self._buf) >= self.flush_every:
+                self.flush()
+            return
         with self.path.open("a", encoding="utf-8") as f:
             f.write(line)
             _fsync_file(f)
+
+    def flush(self) -> None:
+        if not self._buf:
+            return
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("".join(self._buf))
+            _fsync_file(f)
+        self._buf = []
 
 
 def append_jsonl(path: str | Path, record: dict[str, Any]) -> None:

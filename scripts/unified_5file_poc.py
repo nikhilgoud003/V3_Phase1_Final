@@ -840,7 +840,9 @@ def main() -> int:
         et: (cfgs[et].get("clustering") or {}).get("id_prefix", "SJ")
         for et in ("judge", "firm", "party")
     }
-    link_journal = DecisionJournal(out_root / "checkpoint" / "link_decisions.jsonl", fresh=not processed_keys)
+    link_journal = DecisionJournal(
+        out_root / "checkpoint" / "link_decisions.jsonl", fresh=not processed_keys, buffered=True
+    )
 
     final_entities: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
     final_mentions: dict[str, list[dict]] = {"judge": [], "firm": [], "party": []}
@@ -939,6 +941,7 @@ def main() -> int:
                 }
                 if resolved.get("poc"):
                     poc_evidence_all.append({"step": step_i, "file": fp.name, **resolved["poc"]})
+            link_journal.flush()  # one write per file
             sec_resolve = time.perf_counter() - t_resolve
 
             t_write = time.perf_counter()
@@ -993,6 +996,7 @@ def main() -> int:
             )
             print(f"CHECKPOINT file_done={step_i} name={fp.name}", flush=True)
 
+        link_journal.flush()
         # One checkpoint save for the whole run (IDs and serials for later files).
         state["summary_partial"] = {
             "output_dir": str(out_root),
