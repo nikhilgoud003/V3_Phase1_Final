@@ -712,6 +712,12 @@ def main() -> int:
         "Use --fresh to start over.",
     )
     ap.add_argument(
+        "--schema-walk",
+        choices=["on", "off"],
+        default=None,
+        help="Override configs/unified.yaml schema_free_walk.enabled for this run.",
+    )
+    ap.add_argument(
         "--checkpoint-every",
         type=int,
         default=0,
@@ -772,6 +778,12 @@ def main() -> int:
     for etype, cpath in DEFAULT_TYPE_CONFIGS.items():
         cfg = load_config(cpath)
         cfgs[cfg.get("entity_type") or etype] = cfg
+
+    unified_cfg = load_config(ROOT / "configs" / "unified.yaml")
+    schema_walk = bool((unified_cfg.get("schema_free_walk") or {}).get("enabled", False))
+    if args.schema_walk is not None:
+        schema_walk = args.schema_walk == "on"
+    print(f"Schema-free walk: {'on' if schema_walk else 'off'}", flush=True)
 
     sys.path.insert(0, str(ROOT / "scripts"))
     import incremental_resolve as inc  # noqa: E402
@@ -858,10 +870,11 @@ def main() -> int:
                     t["source_file"] = fp.name
                 file_mentions[etype] = mentions
                 file_xfers[etype] = xfers
-            discovered, dlog = discover_unknown_mentions(case, fp.name, cfgs, field_cache)
-            discovery_log.extend(dlog)
-            for etype, ms in discovered.items():
-                file_mentions[etype].extend(ms)
+            if schema_walk:
+                discovered, dlog = discover_unknown_mentions(case, fp.name, cfgs, field_cache)
+                discovery_log.extend(dlog)
+                for etype, ms in discovered.items():
+                    file_mentions[etype].extend(ms)
             attach_party_case_context(
                 file_mentions["party"],
                 file_mentions["judge"],
@@ -1017,6 +1030,7 @@ def main() -> int:
             "cascade_final": final_cascade,
             "poc_party_evidence": poc_evidence_all,
             "discovery": {
+                "schema_free_walk": schema_walk,
                 "n_events": len(discovery_log),
                 "kept": sum(1 for x in discovery_log if x.get("reason") == "discovered_kept"),
                 "rejected": sum(
