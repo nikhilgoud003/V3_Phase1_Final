@@ -389,6 +389,63 @@ def company_legal_form(m: dict, cfg: dict) -> str | None:
     return None
 
 
+def _agency_tokens(text: str) -> tuple[str, ...]:
+    t = (text or "").lower().replace("&", " and ")
+    return tuple(re.sub(r"[^a-z0-9 ]", " ", t).split())
+
+
+@file_memo
+def _federal_agency_index(
+    data_path: Path,
+    invert_heads: tuple[str, ...],
+    federal_prefixes: tuple[str, ...],
+    require_prefix_heads: tuple[str, ...],
+    min_tokens_without_prefix: int,
+) -> dict[tuple[str, ...], str]:
+    """Docket-form name variants -> agency id, built from the official list.
+
+    Catalog names ("Treasury Department") are also indexed in docket order,
+    with and without "the" ("department of treasury", "department of the
+    treasury"). Forms that could be a state body or are short need a federal
+    prefix. A variant claimed by two agencies is dropped.
+    """
+    rows = json.loads(Path(data_path).read_text(encoding="utf-8")).get("agencies") or []
+    prefixes = [tuple(p.split()) for p in federal_prefixes]
+    claims: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    for row in rows:
+        base = _agency_tokens(row.get("name") or "")
+        if not base:
+            continue
+        aid = f"fr:{row.get('slug') or row.get('id')}"
+        forms = {base}
+        if len(base) > 1 and base[-1] in invert_heads:
+            forms.add((base[-1], "of") + base[:-1])
+            forms.add((base[-1], "of", "the") + base[:-1])
+        for f in forms:
+            needs_prefix = f[0] in require_prefix_heads or len(f) < min_tokens_without_prefix
+            if not needs_prefix:
+                claims[f].add(aid)
+                claims[("the",) + f].add(aid)
+            for pre in prefixes:
+                claims[pre + f].add(aid)
+    return {k: next(iter(v)) for k, v in claims.items() if len(v) == 1}
+
+
+def federal_agency_id(m: dict, cfg: dict) -> str | None:
+    """Agency id when the whole party name is a federal agency name (config federal_agencies)."""
+    fa = cfg.get("federal_agencies") or {}
+    if not fa.get("enabled") or not fa.get("data_path"):
+        return None
+    index = _federal_agency_index(
+        resolve_path(cfg, fa["data_path"]),
+        tuple(str(x).lower() for x in fa.get("invert_head_words") or []),
+        tuple(str(x).lower() for x in fa.get("federal_prefixes") or []),
+        tuple(str(x).lower() for x in fa.get("require_prefix_heads") or []),
+        int(fa.get("min_tokens_without_prefix") or 3),
+    )
+    return index.get(_agency_tokens(m.get("raw_name") or ""))
+
+
 def corporate_shared_prefix_conflict(ma: dict, mb: dict, cfg: dict) -> bool:
     """Block corporate auto-merges that share token-1 but differ on token-2 (e.g. Owens).
 
@@ -1075,6 +1132,8 @@ def _block_slot_value(
         return v
     if spec == "company_legal_form" and cfg:
         return company_legal_form(m, cfg)
+    if spec == "federal_agency_id" and cfg:
+        return federal_agency_id(m, cfg)
     v = m.get(spec)
     if v is None or v == "":
         return None
@@ -1418,6 +1477,8 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
             return v or None
         if field == "company_legal_form":
             return company_legal_form(m, cfg)
+        if field == "federal_agency_id":
+            return federal_agency_id(m, cfg)
         if field in {"first_last_initials", "initials"}:
             v = first_last_initials(m.get("normalized_name") or "")
             return v or None

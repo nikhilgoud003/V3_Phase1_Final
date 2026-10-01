@@ -16,7 +16,7 @@ venv/
 *.pem
 credentials.json
 
-# Local data except the four reference files and two placeholders
+# Local data except the reference files and two placeholders
 data/*
 !data/external/
 !data/judges_fjc.csv
@@ -26,6 +26,7 @@ data/external/*
 !data/external/common_surnames.txt
 !data/external/firms_biglaw_cores.txt
 !data/external/fjc_court_crosswalk.json
+!data/external/federal_agencies_federalregister.json
 data/json/*
 !data/json/.gitkeep
 data/runs/*

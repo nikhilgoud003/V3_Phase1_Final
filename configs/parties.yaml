@@ -410,6 +410,7 @@ tier0:
         - us
         - united states
         - united states of america
+        - the united states of america
       merge_scope: global
       confidence: 100
       method: tier0.gov_usa_alias
@@ -424,7 +425,7 @@ tier0:
     lp: [lp, l p]
     ltd: [ltd, limited]
     plc: [plc]
-    ag: [ag]
+    ag: [ag, aktiengesellschaft]
     gmbh: [gmbh]
     sa: [s a]
     bank_na: [n a, national association]
@@ -487,6 +488,34 @@ tier0:
       confidence: 95
       method: tier0.exact_company_name_global
 
+    - id: exact_federal_agency_global
+      description: >
+        Whole party name is one federal agency from the official Federal Register
+        list (see federal_agencies) → one agency entity in any court.
+      type: conjunction
+      fields: [federal_agency_id]
+      min_name_tokens: 1
+      match:
+        forbid_office_class: [placeholder]
+      confidence: 95
+      method: tier0.exact_federal_agency_global
+
+# Federal agencies from the official Federal Register list (data file records
+# its source URL and download date). Matching is general: the whole party name
+# must equal an agency name in catalog or docket word order. No abbreviations
+# (the list's own short names clash with docket usage, e.g. USA, DOC).
+federal_agencies:
+  enabled: true
+  data_path: data/external/federal_agencies_federalregister.json
+  # Catalog "Justice Department" is also matched as "Department of Justice".
+  invert_head_words: [department, bureau, office, corps]
+  # Words that mark a name as federal when written before the agency name.
+  federal_prefixes: [united states, u s, us, the united states, federal]
+  # States have departments/bureaus/offices with the same names, and very short
+  # names are ambiguous: these need a federal prefix.
+  require_prefix_heads: [department, bureau, office]
+  min_tokens_without_prefix: 3
+
 tier1:
   enabled: true
   compound_surnames: []
@@ -526,6 +555,11 @@ tier1:
       fields:
         name: normalized_name
         form: company_legal_form
+    # Court-free block for federal agencies (same reason as company_name_global).
+    - id: federal_agency_global
+      key_template: "{agency}"
+      fields:
+        agency: federal_agency_id
   residual_bucket: "_UNBLOCKED_"
 
 tier2:
