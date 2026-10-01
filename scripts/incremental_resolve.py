@@ -30,7 +30,9 @@ from engine.tiers import (
     UnionFind,
     apply_tier2_auto_merges,
     build_profile_blocks,
+    coparty_conflict,
     load_common_surnames,
+    party_slot,
     run_cascade,
     tier0_merge_groups,
     tier3_adjudicate,
@@ -249,6 +251,8 @@ class SavedIndex:
         self.by_alias: dict[str, list[int]] = defaultdict(list)
         self.by_nid: dict[str, set[int]] = defaultdict(set)
         self.pos: dict[int, int] = {}
+        # Saved mentions by id (filled by the driver), for the co-party barrier.
+        self.mentions: dict[str, dict] = {}
 
     def sync(self, saved: list[dict], cfg: dict) -> None:
         if self.n >= len(saved):
@@ -300,6 +304,20 @@ class SavedIndex:
             for k in blocks.get(m["mention_id"]) or []:
                 hit.update(self.by_block.get(k) or ())
         return [saved[i] for i in sorted(hit)]
+
+
+def _coparty_ok(entity: dict, members: list[dict], index: SavedIndex, by_id: dict, cfg: dict) -> bool:
+    """False when linking would put two separately listed co-parties of one case together."""
+    if not (cfg.get("coparty_barrier") or {}).get("enabled"):
+        return True
+    slots_e = set()
+    for mid in entity.get("mention_ids") or []:
+        m = index.mentions.get(mid) or by_id.get(mid)
+        slot = party_slot(m, cfg) if m else None
+        if slot:
+            slots_e.add(slot)
+    slots_n = {s for s in (party_slot(m, cfg) for m in members) if s}
+    return coparty_conflict(slots_e, slots_n) is None
 
 
 def link_against_saved(
@@ -377,6 +395,7 @@ def link_against_saved(
             proto = c.get("_proto") or {}
             if proto.get("mention_id") and uf.find(proto["mention_id"]) == root_new:
                 hits.append(c)
+        hits = [h for h in hits if _coparty_ok(h, members, index, by_id, cfg)]
         if hits:
             chosen = _pick_hit(hits, ent)
             _absorb(chosen, ent, members)
@@ -424,6 +443,9 @@ def link_against_saved(
             if pid and uf2.find(proto_new["mention_id"]) == uf2.find(pid):
                 linked = c
                 break
+        if linked is not None and not _coparty_ok(linked, members, index, by_id, cfg):
+            linked = None
+            stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
         if linked is not None:
             _absorb(linked, ent, members)
             index.note_absorb(linked)
@@ -441,6 +463,9 @@ def link_against_saved(
                 if pid and uf2.find(proto_new["mention_id"]) == uf2.find(pid):
                     linked = c
                     break
+            if linked is not None and not _coparty_ok(linked, members, index, by_id, cfg):
+                linked = None
+                stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
             if linked is not None:
                 _absorb(linked, ent, members)
                 index.note_absorb(linked)

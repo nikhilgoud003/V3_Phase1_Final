@@ -257,8 +257,9 @@ def adjudicate_poc_evidence_via_tier3(
             continue
 
         final = (row.get("final_decision_after_citation_bar") or "").upper()
+        if final == "MATCH" and not uf.union(ma["mention_id"], mb["mention_id"]):
+            final = "NO_MATCH_COPARTY_BARRIER"
         if final == "MATCH":
-            uf.union(ma["mention_id"], mb["mention_id"])
             merges += 1
             row["merged"] = True
             row["method"] = "poc.tier3_enriched_match"

@@ -818,6 +818,8 @@ def main() -> int:
     embed_cache = inc.EmbedCache(out_root / "checkpoint" / "embed_cache.json")
     state["embed_cache"] = embed_cache
     saved_index = {et: inc.SavedIndex() for et in ("judge", "firm", "party")}
+    for et in ("judge", "firm", "party"):
+        saved_index[et].mentions = {m["mention_id"]: m for m in state["mentions"][et]}
     processed_keys = {(p["file"], p["sha256"]) for p in state["processed"]}
     prefixes = {
         et: (cfgs[et].get("clustering") or {}).get("id_prefix", "SJ")
@@ -915,6 +917,7 @@ def main() -> int:
                 )
                 state["entities"][etype] = saved + fresh
                 state["mentions"][etype].extend(resolved["mentions"])
+                saved_index[etype].mentions.update(resolved["by_id"])
                 state["decisions"].extend(resolved["decisions"])
                 step_cascade[etype] = {
                     "summary": resolved.get("summary"),

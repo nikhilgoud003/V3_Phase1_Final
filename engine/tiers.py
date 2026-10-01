@@ -132,7 +132,8 @@ def apply_tier0_alias_groups(
                     continue
                 if transfer_conflict(by_id[root], by_id[other]):
                     continue
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"][f"alias_group:{gid}"] += 1
                 journal.log(
@@ -201,10 +202,54 @@ def _cache_key(a: dict, b: dict) -> str:
     return f"{court}|{na}|{nb}|{role}"
 
 
+def party_slot(m: dict, cfg: dict) -> tuple[str, Any, str] | None:
+    """(case, party entry, listed name) for a mention from a case party list.
+
+    Config coparty_barrier: only mentions from the listed docket sources that
+    carry a party entry index get a slot. The listed name is the entry's own
+    name (party_name), so an alias read from that entry shares its slot.
+    """
+    spec = cfg.get("coparty_barrier") or {}
+    if not spec.get("enabled"):
+        return None
+    if (m.get("docket_source") or "") not in set(spec.get("docket_sources") or []):
+        return None
+    if m.get("party_enum") is None or not m.get("ucid"):
+        return None
+    name = " ".join(_agency_tokens(m.get("party_name") or m.get("raw_name") or ""))
+    return (str(m["ucid"]), m["party_enum"], name) if name else None
+
+
+def coparty_conflict(slots_a, slots_b) -> tuple[str, Any, Any] | None:
+    """Two different listed names from separate entries of the same case."""
+    if not slots_a or not slots_b:
+        return None
+    by_case: dict[str, list[tuple[Any, str]]] = defaultdict(list)
+    small, big = (slots_a, slots_b) if len(slots_a) <= len(slots_b) else (slots_b, slots_a)
+    for u, e, n in small:
+        by_case[u].append((e, n))
+    for u, e, n in big:
+        for e2, n2 in by_case.get(u, ()):
+            if e2 != e and n2 != n:
+                return (u, n, n2)
+    return None
+
+
 class UnionFind:
     def __init__(self) -> None:
         self.parent: dict[str, str] = {}
         self.rank: dict[str, int] = {}
+        # Optional co-party barrier: root -> frozenset of party slots.
+        self.slots: dict[str, frozenset] | None = None
+        self.blocked: list[tuple[str, str, tuple]] = []
+
+    def enable_slots(self, slot_of: dict[str, tuple | None]) -> None:
+        self.slots = {}
+        for x, slot in slot_of.items():
+            self.add(x)
+            self.slots[self.find(x)] = self.slots.get(self.find(x), frozenset()) | (
+                frozenset([slot]) if slot else frozenset()
+            )
 
     def add(self, x: str) -> None:
         if x not in self.parent:
@@ -218,17 +263,30 @@ class UnionFind:
             x = self.parent[x]
         return x
 
-    def union(self, a: str, b: str) -> None:
+    def union(self, a: str, b: str) -> bool:
+        """Join a and b. Returns False when the co-party barrier blocks it."""
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
-            return
+            return True
+        if self.slots is not None:
+            sa, sb = self.slots.get(ra, frozenset()), self.slots.get(rb, frozenset())
+            why = coparty_conflict(sa, sb)
+            if why:
+                self.blocked.append((a, b, why))
+                return False
         if self.rank[ra] < self.rank[rb]:
             self.parent[ra] = rb
+            root, child = rb, ra
         elif self.rank[ra] > self.rank[rb]:
             self.parent[rb] = ra
+            root, child = ra, rb
         else:
             self.parent[rb] = ra
             self.rank[ra] += 1
+            root, child = ra, rb
+        if self.slots is not None:
+            self.slots[root] = self.slots.get(root, frozenset()) | self.slots.pop(child, frozenset())
+        return True
 
     def components(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = defaultdict(list)
@@ -1547,7 +1605,8 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                         )
                         continue
                     # Distinct FJC NIDs should never reach this bucket; same NID → merge
-                    uf.union(root, other)
+                    if not uf.union(root, other):
+                        continue
                     stats["merges"] += 1
                     stats["rules_fired"][rid] += 1
                     journal.log(
@@ -1696,7 +1755,8 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                     )
                     continue
                 # A4 / pair_allowed is Tier2+Tier3 only — never block Tier0 exact keys
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"][rid] += 1
                 journal.log(
@@ -1777,7 +1837,8 @@ def _tier0_ucid_truncated_span_merges(
                 ok_name, _ = names_compatible(by_id[root], by_id[other], cfg=cfg)
                 if not ok_name or transfer_conflict(by_id[root], by_id[other]):
                     continue
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"]["ucid_truncated_span"] = stats["rules_fired"].get("ucid_truncated_span", 0) + 1
                 journal.log(
@@ -1839,7 +1900,8 @@ def _tier0_ucid_prefix_span_merges(
                 ok_name, _ = names_compatible(by_id[root], by_id[other], cfg=cfg)
                 if not ok_name or transfer_conflict(by_id[root], by_id[other]):
                     continue
-                uf.union(root, other)
+                if not uf.union(root, other):
+                    continue
                 stats["merges"] += 1
                 stats["rules_fired"]["ucid_prefix_span"] = stats["rules_fired"].get("ucid_prefix_span", 0) + 1
                 journal.log(
@@ -2257,7 +2319,9 @@ def apply_tier2_auto_merges(
             continue
 
         if sim >= auto_min and not (barrier and not allow_auto):
-            uf.union(a, b)
+            if not uf.union(a, b):
+                stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
+                continue
             stats["auto_merges"] += 1
             journal.log(
                 {
@@ -2986,8 +3050,13 @@ def tier3_adjudicate(
                 f"[abstain large-cluster fuse: conf={conf}<{barrier_llm_min}] " + rationale
             )
 
+        if decision == "MATCH" and not uf.union(a, b):
+            # Same-case co-party barrier overrides the LLM.
+            stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
+            decision = "NO_MATCH"
+            signals = sorted(set(signals + ["coparty_same_case"]))
+            rationale = "[co-party barrier: separately listed parties in the same case] " + rationale
         if decision == "MATCH":
-            uf.union(a, b)
             stats["merges"] += 1
             out_decision = "MERGE_TIER3"
         elif decision == "NO_MATCH":
@@ -3141,6 +3210,8 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         print(f"Mention hygiene: {hygiene_counts} (quarantined={len(quarantined)})", flush=True)
 
     by_id = {m["mention_id"]: m for m in mentions}
+    if (cfg.get("coparty_barrier") or {}).get("enabled"):
+        uf.enable_slots({mid: party_slot(m, cfg) for mid, m in by_id.items()})
 
     # Teach the name_gate which tokens in this pool are surnames and which are
     # docket prose, so it compares surnames rather than trailing noise.
@@ -3189,7 +3260,8 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
     if (cfg.get("ucid_anchor") or {}).get("enabled", True):
         res = resolve_short_mentions(mentions, cfg)
         for mg in res["merges"]:
-            uf.union(mg["anchor_id"], mg["short_id"])
+            if not uf.union(mg["anchor_id"], mg["short_id"]):
+                continue
             journal.log(
                 {
                     "decision_id": f"dec_{journal.n:08d}",
@@ -3338,10 +3410,28 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             "status": "OK",
         }
 
+    for a, b, why in uf.blocked:
+        journal.log(
+            {
+                "decision_id": f"dec_{journal.n:08d}",
+                "mention_id_a": a,
+                "mention_id_b": b,
+                "entity_type": cfg.get("entity_type"),
+                "decision": "NO_MATCH",
+                "confidence": 100,
+                "method": "barrier.coparty_same_case",
+                "rationale": "Different names listed as separate parties in the same case are different entities",
+                "signals": ["coparty_same_case"],
+                "evidence": {"ucid": why[0], "listed_name_a": why[1], "listed_name_b": why[2]},
+                "timestamp": _now(),
+                "config_version": cfg.get("version"),
+            }
+        )
     components = uf.components()
     elapsed = time.time() - t0
     summary = {
         "n_mentions": len(mentions),
+        "coparty_blocked": len(uf.blocked),
         "n_quarantined": len(quarantined),
         "n_entities_cascade": len(components),
         "n_entities": len(components) + len(quarantined),

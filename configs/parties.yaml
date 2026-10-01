@@ -500,6 +500,14 @@ tier0:
       confidence: 95
       method: tier0.exact_federal_agency_global
 
+# Same-case co-party barrier (general): two different names listed as separate
+# entries of one case's party list are different entities. Enforced inside
+# the union step, so no tier (Tier0 key, UCID anchor, Tier2, Tier3) can merge
+# them, directly or through a third mention.
+coparty_barrier:
+  enabled: true
+  docket_sources: [case_parties]
+
 # Federal agencies from the official Federal Register list (data file records
 # its source URL and download date). Matching is general: the whole party name
 # must equal an agency name in catalog or docket word order. No abbreviations
