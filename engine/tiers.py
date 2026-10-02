@@ -2503,6 +2503,7 @@ def tier3_adjudicate(
 ) -> dict:
     t3 = cfg.get("tier3") or {}
     if not t3.get("enabled", True):
+        record_uncertain(ambiguous, by_id, cfg, "link_to_saved")
         return {"llm_calls": 0, "merges": 0, "skipped": len(ambiguous)}
 
     model = t3.get("model", "qwen2.5:7b")
@@ -3239,6 +3240,42 @@ def tier3_adjudicate(
     return stats
 
 
+# Pairs that would go to Tier3 while Tier3 is off (config tier3.enabled: false).
+# They are not merged; the driver writes them to uncertain_pairs.jsonl.
+UNCERTAIN_ROWS: list[dict] = []
+# Wall-clock seconds per cascade stage, summed over the run (timing only).
+STAGE_SEC: dict[str, float] = defaultdict(float)
+
+
+def record_uncertain(
+    pairs: list, by_id: dict[str, dict], cfg: dict, stage: str, score_kind: str = "tier2_embedding_similarity"
+) -> None:
+    """pairs: (mention_id_a, mention_id_b, score, ...) tuples."""
+    for p in pairs:
+        ma, mb = by_id.get(p[0]) or {}, by_id.get(p[1]) or {}
+        UNCERTAIN_ROWS.append(
+            {
+                "entity_type": cfg.get("entity_type"),
+                "stage": stage,
+                "mention_id_a": p[0],
+                "mention_id_b": p[1],
+                "name_a": ma.get("raw_name"),
+                "name_b": mb.get("raw_name"),
+                "normalized_a": ma.get("normalized_name"),
+                "normalized_b": mb.get("normalized_name"),
+                "ucid_a": ma.get("ucid"),
+                "ucid_b": mb.get("ucid"),
+                "court_a": ma.get("court"),
+                "court_b": mb.get("court"),
+                "source_file_a": ma.get("source_file"),
+                "source_file_b": mb.get("source_file"),
+                "tier2_score": round(float(p[2]), 4) if len(p) > 2 and p[2] is not None else None,
+                "score_kind": score_kind,
+                "decision": "NOT_MERGED_TIER3_OFF",
+            }
+        )
+
+
 # Ollama health check runs once per process for each (endpoint, llm, embed) triple.
 _PREFLIGHT_DONE: set[tuple[str, str, str]] = set()
 
@@ -3325,8 +3362,10 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
 
     # Tier 0
     t0_stats = {}
+    _t = time.perf_counter()
     if (cfg.get("tier0") or {}).get("enabled", True):
         t0_stats = tier0_merge_groups(mentions, cfg, journal, uf)
+    STAGE_SEC["tier0"] += time.perf_counter() - _t
     if fjc_link_stats is not None:
         t0_stats["fjc_link"] = fjc_link_stats
     if hygiene_counts:
@@ -3396,8 +3435,10 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         print(f"UCID anchoring: {anchor_stats}", flush=True)
 
     # Tier 1
+    _t = time.perf_counter()
     mention_blocks = build_profile_blocks(mentions, cfg)
     blocks = invert_blocks(mention_blocks)
+    STAGE_SEC["tier1_blocks"] += time.perf_counter() - _t
 
     # Tier 2
     ambiguous = []
@@ -3410,8 +3451,11 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         tier2_possible = any(
             len({uf.find(mid) for mid in mids}) >= 2 for mids in blocks.values()
         )
+        _t = time.perf_counter()
         if tier2_possible and backend in {"ollama_faiss", "ollama", "faiss"}:
             embed_pack = build_ollama_faiss_pack(mentions, cfg)
+        STAGE_SEC["tier2_embeddings"] += time.perf_counter() - _t
+        _t = time.perf_counter()
         pairs = (
             tier2_candidates(mentions, mention_blocks, blocks, uf, cfg, embed_pack=embed_pack)
             if tier2_possible
@@ -3424,6 +3468,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             "backend", "rapidfuzz_fallback" if tier2_possible else "skipped_no_multi_group_block"
         )
         ambiguous = t2_out["ambiguous"]
+        STAGE_SEC["tier2_pairs_and_auto_merge"] += time.perf_counter() - _t
         # Marginal recall: pairs found by Tier2 that Tier0 had not merged
         reports = resolve_path(cfg, cfg["io"]["reports_dir"])
         reports.mkdir(parents=True, exist_ok=True)
@@ -3443,6 +3488,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
 
     # Tier 3
     t3_stats = {}
+    _t3_start = time.perf_counter()
     if enable_tier3 and (cfg.get("tier3") or {}).get("enabled", True):
         try:
             t3_stats = tier3_adjudicate(ambiguous, by_id, uf, cfg, journal, mention_blocks, len(mentions))
@@ -3481,6 +3527,8 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             100.0 * t3_stats.get("adjudicated_pairs", 0) / max(1, cand), 2
         )
     else:
+        if not (cfg.get("tier3") or {}).get("enabled", True):
+            record_uncertain(ambiguous, by_id, cfg, "within_file")
         t3_stats = {
             "llm_calls": 0,
             "skipped": len(ambiguous),
@@ -3492,6 +3540,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             "status": "OK",
         }
 
+    STAGE_SEC["tier3"] += time.perf_counter() - _t3_start
     for a, b, why in uf.blocked:
         journal.log(
             {

@@ -12,3 +12,10 @@ schema_free_walk:
 # ahead in parallel and resolved in their original order, so results do not
 # change. 0 = CPU count - 1; 1 = in-process. Override with --workers.
 extract_workers: 0
+
+tier3:
+  # LLM (qwen) adjudication of pairs Tier2 leaves ambiguous, for every entity
+  # type (within-file cascade, link to saved entities, party evidence pass).
+  # false: those pairs are NOT merged and are written to uncertain_pairs.jsonl
+  # in the run folder. Override per run with --tier3 on|off.
+  enabled: true

@@ -228,6 +228,13 @@ def adjudicate_poc_evidence_via_tier3(
     merges = 0
     t3 = cfg.get("tier3") or {}
     if not t3.get("enabled", True):
+        from engine.tiers import record_uncertain
+
+        todo = [c for c in cands[:max_pairs] if uf.find(c[0]["mention_id"]) != uf.find(c[1]["mention_id"])]
+        by = {m["mention_id"]: m for c in todo for m in (c[0], c[1])}
+        record_uncertain(
+            [(c[0]["mention_id"], c[1]["mention_id"], c[2]) for c in todo], by, cfg, "party_evidence", score_kind="name_ratio"
+        )
         return {
             "candidates": len(cands),
             "tier3_calls": 0,

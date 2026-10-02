@@ -73,6 +73,12 @@ def apply_runtime_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
     if llm:
         cfg.setdefault("tier3", {})["model"] = llm.strip()
 
+    tier3_env = (os.environ.get("TIER_V3_TIER3") or "").strip().lower()
+    if tier3_env in {"off", "0", "false", "no"}:
+        cfg.setdefault("tier3", {})["enabled"] = False
+    elif tier3_env in {"on", "1", "true", "yes"}:
+        cfg.setdefault("tier3", {})["enabled"] = True
+
     t2_backend = os.environ.get("TIER_V3_TIER2_BACKEND")
     if t2_backend:
         cfg.setdefault("tier2", {})["backend"] = t2_backend.strip()
@@ -108,6 +114,7 @@ _ENV_KEYS = (
     "OLLAMA_ENDPOINT",
     "TIER_V3_LLM_MODEL",
     "TIER_V3_TIER2_BACKEND",
+    "TIER_V3_TIER3",
     "TIER_V3_JSON_DIR",
     "TIER_V3_DATA_DIR",
     "TIER_V3_OUTPUT_DIR",

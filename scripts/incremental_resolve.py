@@ -27,6 +27,7 @@ from engine.poc_party_evidence import adjudicate_poc_evidence_via_tier3, rebuild
 from engine.config_loader import load_config_cached, ollama_endpoint, resolve_path
 from engine.provenance import DecisionJournal
 from engine.tiers import (
+    STAGE_SEC,
     UnionFind,
     apply_tier2_auto_merges,
     build_profile_blocks,
@@ -580,6 +581,7 @@ def resolve_within_file(mentions: list[dict], transfers: list[dict], cfg: dict, 
 
     os.environ["TIER_V3_OUTPUT_DIR"] = str(work_dir)
     cfg = load_config_cached(cfg["_config_path"])
+    _t = time.perf_counter()
     if RUN_CACHE_DIR is not None:
         llm_nv = (cfg.get("name_validity") or {}).get("llm_validation")
         if isinstance(llm_nv, dict):
@@ -591,9 +593,13 @@ def resolve_within_file(mentions: list[dict], transfers: list[dict], cfg: dict, 
         write=True,
         transfer_out_rel="data/mentions/transfer_clues.jsonl",
     )
+    STAGE_SEC["extract_finalize_and_name_validity"] += time.perf_counter() - _t
     if not finalized:
         return {"entities": [], "by_id": {}, "mentions": [], "summary": {}, "decisions": [], "poc": {}}
+    _t = time.perf_counter()
     result = run_cascade(finalized, cfg, enable_tier3=True)
+    STAGE_SEC["cascade_total"] += time.perf_counter() - _t
+    _t = time.perf_counter()
     uf = result["uf"]
     by_id = result["by_id"]
     poc: dict[str, Any] = {}
@@ -617,6 +623,7 @@ def resolve_within_file(mentions: list[dict], transfers: list[dict], cfg: dict, 
         }
     else:
         entities = cluster_mentions(result["components"], by_id, cfg, uf)
+    STAGE_SEC["party_evidence_and_cluster"] += time.perf_counter() - _t
     decisions = []
     for p in (work_dir / "decisions").glob("*.jsonl"):
         for line in p.open(encoding="utf-8"):

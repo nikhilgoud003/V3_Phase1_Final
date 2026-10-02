@@ -52,7 +52,7 @@ from engine.poc_party_evidence import (  # noqa: E402
     rebuild_components,
 )
 from engine.provenance import DecisionJournal  # noqa: E402
-from engine.tiers import LLM_MEMO_STATS, load_llm_memo, run_cascade  # noqa: E402
+from engine.tiers import LLM_MEMO_STATS, STAGE_SEC, UNCERTAIN_ROWS, load_llm_memo, run_cascade  # noqa: E402
 
 # Part B selection (fixed order)
 POC_FILES = [
@@ -717,6 +717,13 @@ def main() -> int:
         help="Override configs/unified.yaml schema_free_walk.enabled for this run.",
     )
     ap.add_argument(
+        "--tier3",
+        choices=["on", "off"],
+        default=None,
+        help="Override configs/unified.yaml tier3.enabled for every entity type. Off: pairs that "
+        "would go to Tier3 are not merged and are written to uncertain_pairs.jsonl.",
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=None,
@@ -779,6 +786,13 @@ def main() -> int:
         files = files[: args.limit]
     print(f"Will process {len(files)} JSON file(s) from {json_root}", flush=True)
     file_names = [fp.name for fp in files]
+
+    unified_pre = load_config(ROOT / "configs" / "unified.yaml")
+    tier3_on = bool((unified_pre.get("tier3") or {}).get("enabled", True))
+    if args.tier3 is not None:
+        tier3_on = args.tier3 == "on"
+    os.environ["TIER_V3_TIER3"] = "on" if tier3_on else "off"
+    print(f"Tier3 (LLM pair adjudication): {'on' if tier3_on else 'off'}", flush=True)
 
     cfgs: dict[str, dict] = {}
     for etype, cpath in DEFAULT_TYPE_CONFIGS.items():
@@ -916,6 +930,7 @@ def main() -> int:
                 )
                 cfg = load_config_cached(cfg_path)
                 journal = link_journal
+                _t_link = time.perf_counter()
                 saved, fresh, link_stats = inc.link_against_saved(
                     resolved["entities"],
                     resolved["by_id"],
@@ -925,6 +940,7 @@ def main() -> int:
                     journal,
                     saved_index[etype],
                 )
+                STAGE_SEC["link_to_saved"] += time.perf_counter() - _t_link
                 fresh, state["next_serial"][etype] = inc.stamp_new_entities(
                     fresh, resolved["by_id"], prefixes[etype], state["next_serial"][etype]
                 )
@@ -1006,6 +1022,7 @@ def main() -> int:
         }
         t_ck = time.perf_counter()
         inc.save_checkpoint(out_root, state)
+        STAGE_SEC["save_checkpoint"] += time.perf_counter() - t_ck
         print(f"CHECKPOINT saved once: {len(state['processed'])} files in {time.perf_counter() - t_ck:.2f}s", flush=True)
         final_entities = state["entities"]
         final_mentions = state["mentions"]
@@ -1045,6 +1062,10 @@ def main() -> int:
             "cross_file_entities": cross_final,
             "embedding_calls": dict(EMBED_STATS),
             "llm_prompt_cache": dict(LLM_MEMO_STATS),
+            "tier3_enabled": tier3_on,
+            "uncertain_pairs": len(UNCERTAIN_ROWS),
+            "stage_sec": {k: round(v, 2) for k, v in STAGE_SEC.items()},
+            "extract_sec_total": round(sum(t.get("sec_extract", 0) for t in state["timings"]), 2),
             "per_file_cumulative": step_summaries,
             "cascade_final": final_cascade,
             "poc_party_evidence": poc_evidence_all,
@@ -1071,6 +1092,8 @@ def main() -> int:
         }
         final_mentions = state["mentions"]
         decisions = list(state["decisions"])
+        if not tier3_on or UNCERTAIN_ROWS:
+            write_jsonl(out_root / "uncertain_pairs.jsonl", UNCERTAIN_ROWS)
         write_final_bundle(
             out_root,
             entities_by_type=final_entities,
