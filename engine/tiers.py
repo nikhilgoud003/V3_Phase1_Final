@@ -241,7 +241,17 @@ class UnionFind:
         self.rank: dict[str, int] = {}
         # Optional co-party barrier: root -> frozenset of party slots.
         self.slots: dict[str, frozenset] | None = None
+        # Optional legal-form families: root -> set of per-mention form sets.
+        self.forms: dict[str, frozenset] | None = None
         self.blocked: list[tuple[str, str, tuple]] = []
+
+    def enable_forms(self, form_of: dict[str, frozenset]) -> None:
+        """Legal-form families per group (union of its mentions' families)."""
+        self.forms = {}
+        for x, fs in form_of.items():
+            self.add(x)
+            r = self.find(x)
+            self.forms[r] = self.forms.get(r, frozenset()) | fs
 
     def enable_slots(self, slot_of: dict[str, tuple | None]) -> None:
         self.slots = {}
@@ -263,11 +273,19 @@ class UnionFind:
             x = self.parent[x]
         return x
 
-    def union(self, a: str, b: str) -> bool:
-        """Join a and b. Returns False when the co-party barrier blocks it."""
+    def union(self, a: str, b: str, *, respect_forms: bool = False) -> bool:
+        """Join a and b. Returns False when the co-party barrier blocks it, or
+        (respect_forms=True) when the two groups carry different legal-form families."""
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
             return True
+        if respect_forms and self.forms is not None:
+            # Two groups whose legal-form families do not overlap at all
+            # (AG vs Corp, LLC vs PLC) are different legal entities.
+            fa, fb = self.forms.get(ra, frozenset()), self.forms.get(rb, frozenset())
+            if fa and fb and not (fa & fb):
+                self.blocked.append((a, b, ("legal_form", sorted(fa), sorted(fb))))
+                return False
         if self.slots is not None:
             sa, sb = self.slots.get(ra, frozenset()), self.slots.get(rb, frozenset())
             why = coparty_conflict(sa, sb)
@@ -286,6 +304,8 @@ class UnionFind:
             root, child = ra, rb
         if self.slots is not None:
             self.slots[root] = self.slots.get(root, frozenset()) | self.slots.pop(child, frozenset())
+        if self.forms is not None:
+            self.forms[root] = self.forms.get(root, frozenset()) | self.forms.pop(child, frozenset())
         return True
 
     def components(self) -> dict[str, list[str]]:
@@ -804,10 +824,19 @@ def generational_suffix_conflict(ma: dict, mb: dict, cfg: dict) -> bool:
     return True
 
 
-def _legal_entity_forms(name: str, forms_cfg: dict) -> set[str]:
+def _legal_entity_forms(name: str, forms_cfg: dict, end_only: frozenset = frozenset()) -> set[str]:
     n = f" {(name or '').lower().replace('&', ' and ')} "
+    tail = re.sub(r"[^a-z0-9 ]", " ", n).split()
     found: set[str] = set()
     for form_id, aliases in (forms_cfg or {}).items():
+        if form_id in end_only:
+            # Only at the end of the name: "Rhone-Poulenc AG Co., Inc." is not an AG.
+            for alias in aliases or []:
+                a = re.sub(r"[^a-z0-9 ]", " ", str(alias).lower()).split()
+                if a and len(tail) > len(a) and tail[-len(a):] == a:
+                    found.add(str(form_id))
+                    break
+            continue
         for alias in aliases or []:
             a = str(alias).strip().lower()
             if not a:
@@ -818,6 +847,18 @@ def _legal_entity_forms(name: str, forms_cfg: dict) -> set[str]:
     return found
 
 
+def legal_entity_form_set(m: dict, cfg: dict) -> frozenset:
+    """Legal-form families of one mention (config identity_exclusions.legal_entity_form)."""
+    spec = _excl(cfg).get("legal_entity_form") or {}
+    forms_cfg = spec.get("forms") or {}
+    if not spec.get("enabled") or not forms_cfg:
+        return frozenset()
+    end_only = frozenset(spec.get("end_only_forms") or [])
+    return frozenset(
+        _legal_entity_forms(_norm_name(m), forms_cfg, end_only) | _legal_entity_forms(_raw_name(m), forms_cfg, end_only)
+    )
+
+
 def legal_entity_form_conflict(ma: dict, mb: dict, cfg: dict) -> bool:
     """L.P. / G.P. / Inc. / LLC / Trust are not interchangeable when both present."""
     spec = _excl(cfg).get("legal_entity_form") or {}
@@ -826,11 +867,12 @@ def legal_entity_form_conflict(ma: dict, mb: dict, cfg: dict) -> bool:
     forms_cfg = spec.get("forms") or {}
     if not forms_cfg:
         return False
-    fa = _legal_entity_forms(_norm_name(ma), forms_cfg) | _legal_entity_forms(
-        _raw_name(ma), forms_cfg
+    end_only = frozenset(spec.get("end_only_forms") or [])
+    fa = _legal_entity_forms(_norm_name(ma), forms_cfg, end_only) | _legal_entity_forms(
+        _raw_name(ma), forms_cfg, end_only
     )
-    fb = _legal_entity_forms(_norm_name(mb), forms_cfg) | _legal_entity_forms(
-        _raw_name(mb), forms_cfg
+    fb = _legal_entity_forms(_norm_name(mb), forms_cfg, end_only) | _legal_entity_forms(
+        _raw_name(mb), forms_cfg, end_only
     )
     if not fa or not fb:
         return False
@@ -1659,6 +1701,9 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
             continue
 
         fields = rule.get("fields") or []
+        forbid_forms = bool((rule.get("match") or {}).get("forbid_legal_form_conflict"))
+        if forbid_forms and uf.forms is None:
+            uf.enable_forms({m["mention_id"]: legal_entity_form_set(m, cfg) for m in mentions})
         require_non_null = set(rule.get("require_non_null") or [])
         min_tokens = rule.get("min_name_tokens")
         min_cc_tokens = rule.get("min_corp_core_tokens")
@@ -1783,7 +1828,7 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                     )
                     continue
                 # A4 / pair_allowed is Tier2+Tier3 only — never block Tier0 exact keys
-                if not uf.union(root, other):
+                if not uf.union(root, other, respect_forms=forbid_forms):
                     continue
                 stats["merges"] += 1
                 stats["rules_fired"][rid] += 1
@@ -1865,7 +1910,7 @@ def _tier0_ucid_truncated_span_merges(
                 ok_name, _ = names_compatible(by_id[root], by_id[other], cfg=cfg)
                 if not ok_name or transfer_conflict(by_id[root], by_id[other]):
                     continue
-                if not uf.union(root, other):
+                if not uf.union(root, other, respect_forms=True):
                     continue
                 stats["merges"] += 1
                 stats["rules_fired"]["ucid_truncated_span"] = stats["rules_fired"].get("ucid_truncated_span", 0) + 1
@@ -1928,7 +1973,7 @@ def _tier0_ucid_prefix_span_merges(
                 ok_name, _ = names_compatible(by_id[root], by_id[other], cfg=cfg)
                 if not ok_name or transfer_conflict(by_id[root], by_id[other]):
                     continue
-                if not uf.union(root, other):
+                if not uf.union(root, other, respect_forms=True):
                     continue
                 stats["merges"] += 1
                 stats["rules_fired"]["ucid_prefix_span"] = stats["rules_fired"].get("ucid_prefix_span", 0) + 1
@@ -3542,6 +3587,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
 
     STAGE_SEC["tier3"] += time.perf_counter() - _t3_start
     for a, b, why in uf.blocked:
+        is_form = why[0] == "legal_form"
         journal.log(
             {
                 "decision_id": f"dec_{journal.n:08d}",
@@ -3550,10 +3596,18 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
                 "entity_type": cfg.get("entity_type"),
                 "decision": "NO_MATCH",
                 "confidence": 100,
-                "method": "barrier.coparty_same_case",
-                "rationale": "Different names listed as separate parties in the same case are different entities",
-                "signals": ["coparty_same_case"],
-                "evidence": {"ucid": why[0], "listed_name_a": why[1], "listed_name_b": why[2]},
+                "method": "barrier.legal_form_family" if is_form else "barrier.coparty_same_case",
+                "rationale": (
+                    "Different legal-form families (e.g. AG vs Corp, LLC vs PLC) are different legal entities"
+                    if is_form
+                    else "Different names listed as separate parties in the same case are different entities"
+                ),
+                "signals": ["legal_form_family" if is_form else "coparty_same_case"],
+                "evidence": (
+                    {"forms_a": why[1], "forms_b": why[2]}
+                    if is_form
+                    else {"ucid": why[0], "listed_name_a": why[1], "listed_name_b": why[2]}
+                ),
                 "timestamp": _now(),
                 "config_version": cfg.get("version"),
             }

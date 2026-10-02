@@ -373,8 +373,16 @@ identity_exclusions:
       lp: ["l p", "lp", "l.p", "l.p.", "limited partnership"]
       gp: ["g p", "gp", "g.p", "g.p.", "general partnership"]
       llc: ["llc", "l.l.c", "l.l.c."]
-      inc: ["inc", "inc.", "incorporated"]
+      # US corporation family: Inc / Corp / Company / Co are interchangeable.
+      inc: ["inc", "inc.", "incorporated", "corp", "corp.", "corporation", "company", "co", "co."]
       trust: ["trust"]
+      ag: ["ag", "aktiengesellschaft"]
+      plc: ["plc", "p.l.c.", "p l c"]
+      gmbh: ["gmbh"]
+      ltd: ["ltd", "ltd.", "limited"]
+      na: ["n a", "n.a.", "national association"]
+    # These count only at the end of the name ("Rhone-Poulenc AG Co., Inc." is an Inc).
+    end_only_forms: [ag, plc, gmbh, ltd, na]
   placeholder:
     enabled: true
     office_class: placeholder
@@ -446,6 +454,8 @@ tier0:
       type: conjunction
       fields: [normalized_name, ucid]
       confidence: 100
+      match:
+        forbid_legal_form_conflict: true
       method: tier0.exact_name_ucid
 
     - id: exact_normalized_name_same_court_pacer_id
@@ -455,6 +465,8 @@ tier0:
       require_non_null: [pacer_id]
       min_name_tokens: 1
       confidence: 99
+      match:
+        forbid_legal_form_conflict: true
       method: tier0.exact_name_court_pacer_id
 
     - id: exact_normalized_name_same_court
@@ -466,6 +478,7 @@ tier0:
       fields: [normalized_name, court]
       min_name_tokens: 2
       match:
+        forbid_legal_form_conflict: true
         forbid_office_class: [placeholder]
       confidence: 95
       method: tier0.exact_name_court
@@ -478,6 +491,7 @@ tier0:
       fields: [corp_core, court]
       min_corp_core_tokens: 1
       match:
+        forbid_legal_form_conflict: true
         require:
           - office_class_equals_corporate
       confidence: 95
@@ -492,6 +506,7 @@ tier0:
       fields: [normalized_name, company_legal_form]
       min_name_tokens: 1
       match:
+        forbid_legal_form_conflict: true
         forbid_office_class: [placeholder, government]
       confidence: 95
       method: tier0.exact_company_name_global

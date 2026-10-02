@@ -32,6 +32,7 @@ from engine.tiers import (
     apply_tier2_auto_merges,
     build_profile_blocks,
     coparty_conflict,
+    legal_entity_form_set,
     load_common_surnames,
     party_slot,
     run_cascade,
@@ -258,6 +259,8 @@ class SavedIndex:
         self.mentions: dict[str, dict] = {}
         # Per-entity co-party slots, built once and updated on absorb.
         self.slot_cache: dict[int, set] = {}
+        # Per-entity legal-form families (parties), built once and updated on absorb.
+        self.form_cache: dict[int, set] = {}
 
     def sync(self, saved: list[dict], cfg: dict) -> None:
         if self.n >= len(saved):
@@ -291,6 +294,22 @@ class SavedIndex:
                 slot = party_slot(m, cfg)
                 if slot:
                     self.slot_cache[i].add(slot)
+        if i in self.form_cache and members and cfg is not None:
+            for m in members:
+                self.form_cache[i] |= legal_entity_form_set(m, cfg)
+
+    def entity_forms(self, entity: dict, by_id: dict, cfg: dict) -> set:
+        i = self.pos.get(id(entity))
+        if i is not None and i in self.form_cache:
+            return self.form_cache[i]
+        forms: set = set()
+        for mid in entity.get("mention_ids") or []:
+            m = self.mentions.get(mid) or by_id.get(mid)
+            if m:
+                forms |= legal_entity_form_set(m, cfg)
+        if i is not None:
+            self.form_cache[i] = forms
+        return forms
 
     def entity_slots(self, entity: dict, by_id: dict, cfg: dict) -> set:
         i = self.pos.get(id(entity))
@@ -395,6 +414,18 @@ def _log_link(
     )
 
 
+def _forms_ok(entity: dict, members: list[dict], index: SavedIndex, by_id: dict, cfg: dict) -> bool:
+    """False when the saved entity and the new one carry legal-form families that
+    do not overlap at all (AG vs Corp, LLC vs PLC). Only where a Tier0 rule opts in."""
+    if not any((r.get("match") or {}).get("forbid_legal_form_conflict") for r in (cfg.get("tier0") or {}).get("rules") or []):
+        return True
+    fe = index.entity_forms(entity, by_id, cfg)
+    fn: set = set()
+    for m in members:
+        fn |= legal_entity_form_set(m, cfg)
+    return not (fe and fn and not (fe & fn))
+
+
 def link_against_saved(
     new_entities: list[dict],
     by_id: dict[str, dict],
@@ -469,7 +500,7 @@ def link_against_saved(
             proto = c.get("_proto") or {}
             if proto.get("mention_id") and uf.find(proto["mention_id"]) == root_new:
                 hits.append(c)
-        hits = [h for h in hits if _coparty_ok(h, members, index, by_id, cfg)]
+        hits = [h for h in hits if _coparty_ok(h, members, index, by_id, cfg) and _forms_ok(h, members, index, by_id, cfg)]
         if hits:
             chosen = _pick_hit(hits, ent)
             _absorb(chosen, ent, members)
@@ -510,7 +541,7 @@ def link_against_saved(
             if pid and uf2.find(proto_new["mention_id"]) == uf2.find(pid):
                 linked = c
                 break
-        if linked is not None and not _coparty_ok(linked, members, index, by_id, cfg):
+        if linked is not None and not (_coparty_ok(linked, members, index, by_id, cfg) and _forms_ok(linked, members, index, by_id, cfg)):
             linked = None
             stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
         if linked is not None:
@@ -536,7 +567,7 @@ def link_against_saved(
                 if pid and uf2.find(proto_new["mention_id"]) == uf2.find(pid):
                     linked = c
                     break
-            if linked is not None and not _coparty_ok(linked, members, index, by_id, cfg):
+            if linked is not None and not (_coparty_ok(linked, members, index, by_id, cfg) and _forms_ok(linked, members, index, by_id, cfg)):
                 linked = None
                 stats["coparty_blocked"] = stats.get("coparty_blocked", 0) + 1
             if linked is not None:
