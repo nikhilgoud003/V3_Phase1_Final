@@ -8,7 +8,8 @@ torteya"). Trailing junk words ("bond") and date tokens are ignored, so
   - both first names start with the same letter (same_first_letter);
   - middle names agree (equal or initial) when both names have them;
   - every name it fits in its court + last name is a form of one judge;
-  - two different FJC ids never join (UnionFind / caller check).
+  - two different FJC ids never join;
+  - two different generational suffixes never join (Jr. vs Sr., II vs III).
 """
 
 from __future__ import annotations
@@ -48,6 +49,12 @@ def clean_judge_tokens(normalized: str, rule: dict) -> list[str]:
     while toks and toks[0].rstrip(".").lower() in GENERATIONAL_SUFFIXES:
         toks.pop(0)
     return toks
+
+
+def judge_suffix(normalized: str) -> str:
+    """Generational suffix of a judge name ("jr", "iii"), or ""."""
+    toks = [t.rstrip(".").lower() for t in (normalized or "").split()]
+    return next((t for t in reversed(toks) if t in GENERATIONAL_SUFFIXES), "")
 
 
 def _osa(a: str, b: str, cap: int) -> int:
@@ -100,12 +107,27 @@ def _same_judge(x: tuple, y: tuple, rule: dict) -> bool:
 
 
 def judge_typo_merges(mentions: list[dict], rule: dict) -> list[dict[str, Any]]:
-    """Return merges [{a, b, name_a, name_b, court}] for one Tier0 pass."""
+    """Return merges [{a, b, name_a, name_b, court}] for one Tier0 pass.
+
+    Names with different FJC ids or different generational suffixes
+    (Jr. vs Sr., II vs III) never join.
+    """
     groups: dict[tuple, dict[tuple, list[dict]]] = defaultdict(lambda: defaultdict(list))
     for m in mentions:
         toks = clean_judge_tokens(m.get("normalized_name") or "", rule)
         if len(toks) >= 2 and m.get("court"):
             groups[(m["court"], toks[-1])][tuple(toks)].append(m)
+
+    def nids(ms: list[dict]) -> set[str]:
+        return {str(m["fjc_nid"]) for m in ms if m.get("fjc_nid")}
+
+    def compatible(a: dict, b: dict) -> bool:
+        sa, sb = judge_suffix(a.get("normalized_name") or ""), judge_suffix(b.get("normalized_name") or "")
+        if sa and sb and sa != sb:
+            return False
+        na, nb = nids([a]), nids([b])
+        return not (na and nb and not na & nb)
+
     out: list[dict[str, Any]] = []
     for (court, _), names in groups.items():
         keys = list(names)
@@ -113,13 +135,19 @@ def judge_typo_merges(mentions: list[dict], rule: dict) -> list[dict[str, Any]]:
             # identical cleaned names join each other (junk tail only)
             ms = names[k]
             for m in ms[1:]:
-                if m.get("normalized_name") != ms[0].get("normalized_name"):
+                if m.get("normalized_name") != ms[0].get("normalized_name") and compatible(ms[0], m):
                     out.append(dict(a=ms[0]["mention_id"], b=m["mention_id"], name_a=ms[0]["normalized_name"],
                                     name_b=m["normalized_name"], court=court, how="junk_tail"))
-            fits = [o for o in keys if o != k and typo_fit(list(k), list(o), rule)]
+            fits = [
+                o for o in keys
+                if o != k and typo_fit(list(k), list(o), rule)
+                and all(compatible(x, y) for x in ms for y in names[o])
+            ]
             # Several fits are fine only when they are forms of one judge
             # ("ronald g morgan" / "ronal g morgan").
             if not fits or not all(_same_judge(x, y, rule) for x in fits for y in fits if x < y):
+                continue
+            if len(set().union(*(nids(names[o]) for o in fits))) > 1:
                 continue
             o = max(fits, key=lambda x: len(names[x]))
             out.append(dict(a=names[o][0]["mention_id"], b=ms[0]["mention_id"], name_a=" ".join(o),

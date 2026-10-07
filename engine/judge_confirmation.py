@@ -29,6 +29,7 @@ class JudgeConfirmation:
         self.confirm_sources = set(spec.get("confirm_sources") or ["case_header", "case_parties"])
         self.confirm_prefixes = set(spec.get("confirm_prefix_categories") or [])
         self.title_shape = bool(spec.get("title_name_shape_check", True))
+        self.particles = {str(w).lower().rstrip(".") for w in spec.get("name_particles") or []}
         self.min_cases = int(spec.get("min_cases", 2))
         n = cfg.get("normalization") or {}
         rule = next((r for r in (cfg.get("tier0") or {}).get("rules") or [] if r.get("id") == "fjc_nid_join"), {})
@@ -73,7 +74,8 @@ class JudgeConfirmation:
 
     def _title_ok(self, name: str, ms: list[dict], strong: set[str]) -> bool:
         """A name read right after a judge title, with a clean name shape:
-        (a) every word starts with a capital ("Hurd directs" fails);
+        (a) every word starts with a capital ("Hurd directs" fails), except
+            lowercase name particles (de, la, del, van, von, ...: "de la Rosa");
         (b) no ALL-CAPS name followed by a normal word ("RAPOPORT Initial");
         (c) not a known judge name plus trailing words ("Ronald G. Morgan Final"),
             and not a known judge surname of this court plus a word ("Bucklo Mailed")."""
@@ -94,12 +96,14 @@ class JudgeConfirmation:
         for raw in raws:
             words = [w.strip(".,;:()'\"") for w in raw.split()]
             words = [w for w in words if w]
-            if not words or not all(w[0].isupper() for w in words):
+            part = [w.lower() in self.particles for w in words]
+            if not words or all(part) or not all(p or w[0].isupper() for w, p in zip(words, part)):
                 continue
+            core = [w for w, p in zip(words, part) if not p]
             caps_break = any(
                 w.isupper() and sum(c.isalpha() for c in w) >= 3 and w.lower() not in GENERATIONAL_SUFFIXES
                 and not nxt.isupper()
-                for w, nxt in zip(words, words[1:])
+                for w, nxt in zip(core, core[1:])
             )
             if not caps_break:
                 return True

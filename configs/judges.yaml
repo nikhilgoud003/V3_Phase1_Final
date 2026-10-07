@@ -248,13 +248,17 @@ name_validity:
   confirmation:
     enabled: false
     confirm_sources: [case_header, case_parties]
-    confirm_prefix_categories: [regex_judge_title]
+    # Titles: "Judge X" / "Magistrate Judge X" (regex_judge_title) and
+    # "Honorable X" / "Hon. X" (regex_honorable, spacy_PERSON_honorific).
+    confirm_prefix_categories: [regex_judge_title, regex_honorable, spacy_PERSON_honorific]
     # Title-confirmed names must also have a clean name shape: every word
     # capitalised ("Hurd directs" fails), no ALL-CAPS name followed by a normal
     # word ("RAPOPORT Initial Appearance"), not a known judge name plus trailing
     # words ("Ronald G. Morgan Final"), not a known judge surname of the court
     # plus a word ("Bucklo Mailed"). Failing names stay held (can still promote).
     title_name_shape_check: true
+    # Lowercase particles allowed inside a title-read name ("de la Rosa").
+    name_particles: [de, la, del, van, von, da, di, du, le, st]
     min_cases: 2
   min_name_tokens: 2
   reject_single_char_second_token: true
@@ -396,7 +400,8 @@ tier0:
       confidence: 99
       method: tier0.exact_name_office_court
 
-    # Fix (g): typo duplicates. Same court + same last name + first name 1-2
+    # Fix (g): typo duplicates. Never joins names with different FJC ids or
+    # different generational suffixes (Jr. vs Sr., II vs III). Same court + same last name + first name 1-2
     # letters off (a swap of two letters counts as one) = same judge:
     # "rondald g morgan" -> "ronald g morgan", "igancio torteya" -> "ignacio
     # torteya". Trailing junk words and dates are ignored ("ronald g morgan
