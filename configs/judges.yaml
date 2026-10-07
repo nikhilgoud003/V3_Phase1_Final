@@ -234,6 +234,16 @@ name_compat:
 # -----------------------------------------------------------------------------
 name_validity:
   enabled: true
+  # Judge-name confirmation without an LLM (engine/judge_confirmation.py).
+  # Bulk mode (--bulk) turns this on and the llm_validation check below off.
+  # A docket-only name is a judge if it is in FJC, in a case header / party
+  # judge field, already confirmed in the run, or seen in min_cases cases;
+  # otherwise it is held as unconfirmed (unconfirmed_judges.jsonl) and promoted
+  # when it appears in a second case.
+  confirmation:
+    enabled: false
+    confirm_sources: [case_header, case_parties]
+    min_cases: 2
   min_name_tokens: 2
   reject_single_char_second_token: true
   quarantine_out: "data/mentions/quarantine_name_validity.jsonl"

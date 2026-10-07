@@ -19,3 +19,9 @@ tier3:
   # false: those pairs are NOT merged and are written to uncertain_pairs.jsonl
   # in the run folder. Override per run with --tier3 on|off.
   enabled: true
+
+# Bulk mode (--bulk): no LLM calls anywhere - Tier3 off, Qwen judge-name check
+# off, rule-based judge-name confirmation on (judges.yaml
+# name_validity.confirmation). Embeddings (Tier2) stay on. Use for large runs;
+# leave false for single new files, where Tier3/Qwen may still be used.
+bulk: false

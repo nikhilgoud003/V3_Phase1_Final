@@ -717,6 +717,13 @@ def main() -> int:
         help="Override configs/unified.yaml schema_free_walk.enabled for this run.",
     )
     ap.add_argument(
+        "--bulk",
+        action="store_true",
+        default=None,
+        help="Bulk mode: no LLM calls anywhere (Tier3 off, Qwen judge-name check off, rule-based "
+        "judge-name confirmation on). Default: configs/unified.yaml bulk.",
+    )
+    ap.add_argument(
         "--tier3",
         choices=["on", "off"],
         default=None,
@@ -791,7 +798,14 @@ def main() -> int:
     tier3_on = bool((unified_pre.get("tier3") or {}).get("enabled", True))
     if args.tier3 is not None:
         tier3_on = args.tier3 == "on"
+    bulk = bool(unified_pre.get("bulk", False)) if args.bulk is None else True
+    if bulk:
+        tier3_on = False
+        os.environ["TIER_V3_BULK"] = "1"
+    else:
+        os.environ.pop("TIER_V3_BULK", None)
     os.environ["TIER_V3_TIER3"] = "on" if tier3_on else "off"
+    print(f"Mode: {'BULK (no LLM calls)' if bulk else 'single/standard'}", flush=True)
     print(f"Tier3 (LLM pair adjudication): {'on' if tier3_on else 'off'}", flush=True)
 
     cfgs: dict[str, dict] = {}
@@ -847,6 +861,11 @@ def main() -> int:
     embed_cache = inc.EmbedCache(out_root / "checkpoint" / "embed_cache.json")
     state["embed_cache"] = embed_cache
     saved_index = {et: inc.SavedIndex() for et in ("judge", "firm", "party")}
+    from engine.judge_confirmation import JudgeConfirmation
+
+    judge_confirm = JudgeConfirmation(load_config_cached(DEFAULT_TYPE_CONFIGS["judge"]), state)
+    if judge_confirm.enabled:
+        print("Judge-name confirmation: rule-based (FJC / header / 2+ cases)", flush=True)
     for et in ("judge", "firm", "party"):
         saved_index[et].mentions = {m["mention_id"]: m for m in state["mentions"][et]}
     processed_keys = {(p["file"], p["sha256"]) for p in state["processed"]}
@@ -904,6 +923,7 @@ def main() -> int:
                 discovery_log.extend(dlog)
                 for etype, ms in discovered.items():
                     file_mentions[etype].extend(ms)
+            file_mentions["judge"] = judge_confirm.filter_file(file_mentions["judge"])
             attach_party_case_context(
                 file_mentions["party"],
                 file_mentions["judge"],
@@ -1064,6 +1084,10 @@ def main() -> int:
             "llm_prompt_cache": dict(LLM_MEMO_STATS),
             "tier3_enabled": tier3_on,
             "uncertain_pairs": len(UNCERTAIN_ROWS),
+            "bulk_mode": bulk,
+            "judge_confirmation": dict(judge_confirm.stats, enabled=judge_confirm.enabled,
+                                       unconfirmed_mentions=sum(len(v) for v in judge_confirm.pending.values()),
+                                       unconfirmed_names=len(judge_confirm.pending)),
             "stage_sec": {k: round(v, 2) for k, v in STAGE_SEC.items()},
             "extract_sec_total": round(sum(t.get("sec_extract", 0) for t in state["timings"]), 2),
             "per_file_cumulative": step_summaries,
@@ -1092,6 +1116,8 @@ def main() -> int:
         }
         final_mentions = state["mentions"]
         decisions = list(state["decisions"])
+        if judge_confirm.enabled:
+            write_jsonl(out_root / "unconfirmed_judges.jsonl", judge_confirm.unconfirmed_rows())
         if not tier3_on or UNCERTAIN_ROWS:
             write_jsonl(out_root / "uncertain_pairs.jsonl", UNCERTAIN_ROWS)
         write_final_bundle(

@@ -164,6 +164,9 @@ def load_checkpoint(out_root: Path) -> dict[str, Any] | None:
         "party": _load("mentions_party.jsonl"),
     }
     state["decisions"] = _load("decisions.jsonl")
+    jc = ck / "judge_confirm.json"
+    if jc.is_file():
+        state["judge_confirm"] = json.loads(jc.read_text(encoding="utf-8"))
     return state
 
 
@@ -182,6 +185,8 @@ def save_checkpoint(out_root: Path, state: dict[str, Any]) -> None:
         _atomic_write(ck / f"entities_{et}.jsonl", _rows_text(state["entities"][et]))
         _atomic_write(ck / f"mentions_{et}.jsonl", _rows_text(state["mentions"][et]))
     _atomic_write(ck / "decisions.jsonl", _rows_text(state["decisions"]))
+    if state.get("judge_confirm"):
+        _atomic_write(ck / "judge_confirm.json", json.dumps(state["judge_confirm"], ensure_ascii=False))
     if state.get("embed_cache") is not None:
         state["embed_cache"].save()
     save_llm_memo(ck / "llm_prompt_cache.jsonl")

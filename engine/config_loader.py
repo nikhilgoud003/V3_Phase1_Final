@@ -73,6 +73,18 @@ def apply_runtime_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
     if llm:
         cfg.setdefault("tier3", {})["model"] = llm.strip()
 
+    if (os.environ.get("TIER_V3_BULK") or "").strip().lower() in {"1", "on", "true", "yes"}:
+        # Bulk mode: no LLM anywhere. Tier3 off, LLM name check off,
+        # rule-based judge-name confirmation on.
+        cfg.setdefault("tier3", {})["enabled"] = False
+        nv = cfg.get("name_validity")
+        if isinstance(nv, dict):
+            nv.setdefault("llm_validation", {})
+            if isinstance(nv["llm_validation"], dict):
+                nv["llm_validation"]["enabled"] = False
+            if isinstance(nv.get("confirmation"), dict):
+                nv["confirmation"]["enabled"] = True
+
     tier3_env = (os.environ.get("TIER_V3_TIER3") or "").strip().lower()
     if tier3_env in {"off", "0", "false", "no"}:
         cfg.setdefault("tier3", {})["enabled"] = False
@@ -115,6 +127,7 @@ _ENV_KEYS = (
     "TIER_V3_LLM_MODEL",
     "TIER_V3_TIER2_BACKEND",
     "TIER_V3_TIER3",
+    "TIER_V3_BULK",
     "TIER_V3_JSON_DIR",
     "TIER_V3_DATA_DIR",
     "TIER_V3_OUTPUT_DIR",
