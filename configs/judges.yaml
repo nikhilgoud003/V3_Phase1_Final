@@ -249,6 +249,12 @@ name_validity:
     enabled: false
     confirm_sources: [case_header, case_parties]
     confirm_prefix_categories: [regex_judge_title]
+    # Title-confirmed names must also have a clean name shape: every word
+    # capitalised ("Hurd directs" fails), no ALL-CAPS name followed by a normal
+    # word ("RAPOPORT Initial Appearance"), not a known judge name plus trailing
+    # words ("Ronald G. Morgan Final"), not a known judge surname of the court
+    # plus a word ("Bucklo Mailed"). Failing names stay held (can still promote).
+    title_name_shape_check: true
     min_cases: 2
   min_name_tokens: 2
   reject_single_char_second_token: true
