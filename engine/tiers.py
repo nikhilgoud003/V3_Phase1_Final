@@ -1250,6 +1250,9 @@ def build_profile_blocks(mentions: list[dict], cfg: dict) -> dict[str, list[str]
     strategies = (cfg.get("tier1") or {}).get("strategies") or []
     residual = (cfg.get("tier1") or {}).get("residual_bucket", "_UNBLOCKED_")
     compounds = _compound_surnames_from_cfg(cfg)
+    from engine.judge_typo import clean_judge_tokens, typo_rule
+
+    typo = typo_rule(cfg)
     out: dict[str, list[str]] = {}
     for m in mentions:
         keys: list[str] = []
@@ -1257,6 +1260,11 @@ def build_profile_blocks(mentions: list[dict], cfg: dict) -> dict[str, list[str]
         surnames = surname_block_keys(m.get("normalized_name") or "", compound_surnames=compounds)
         if not surnames and (m.get("surname") or ""):
             surnames = [str(m["surname"]).lower()]
+        if typo:
+            # Fix (g): also block on the surname with trailing junk / dates removed.
+            ct = clean_judge_tokens(m.get("normalized_name") or "", typo)
+            if len(ct) >= 2 and ct[-1] not in surnames:
+                surnames = list(surnames) + [ct[-1]]
         initials = first_last_initials(m.get("normalized_name") or "")
         court = m.get("court") or ""
         year = m.get("year")
@@ -1691,6 +1699,37 @@ def tier0_merge_groups(mentions: list[dict], cfg: dict, journal: DecisionJournal
                         "rationale": f"{m.get('relationship_type')} alias in the entity's own record",
                         "signals": ["explicit_alias", str(m.get("relationship_type"))],
                         "evidence": {"rule": rid, "alias": m.get("raw_name"), "of": by_id[target].get("raw_name")},
+                        "timestamp": _now(),
+                        "config_version": cfg.get("version"),
+                    }
+                )
+            continue
+
+        if rule.get("type") == "judge_name_typo":
+            # Fix (g): same court + same last name + first name 1-2 letters off,
+            # trailing junk words / dates ignored (engine/judge_typo.py).
+            from engine.judge_typo import judge_typo_merges
+
+            for mg in judge_typo_merges(mentions, rule):
+                a, b = by_id[mg["a"]], by_id[mg["b"]]
+                if a.get("fjc_nid") and b.get("fjc_nid") and str(a["fjc_nid"]) != str(b["fjc_nid"]):
+                    continue
+                if uf.find(mg["a"]) == uf.find(mg["b"]) or not uf.union(mg["a"], mg["b"]):
+                    continue
+                stats["merges"] += 1
+                stats["rules_fired"][rid] += 1
+                journal.log(
+                    {
+                        "decision_id": f"dec_{journal.n:08d}",
+                        "mention_id_a": mg["a"],
+                        "mention_id_b": mg["b"],
+                        "entity_type": cfg.get("entity_type"),
+                        "decision": "MERGE_TIER0",
+                        "confidence": int(rule.get("confidence", 95)),
+                        "method": rule.get("method") or f"tier0.{rid}",
+                        "rationale": f"Same court {mg['court']}: {mg['name_b']!r} is a typo/junk form of {mg['name_a']!r} ({mg['how']})",
+                        "signals": ["judge_name_typo", mg["how"]],
+                        "evidence": {k: mg[k] for k in ("court", "name_a", "name_b", "how")},
                         "timestamp": _now(),
                         "config_version": cfg.get("version"),
                     }

@@ -381,6 +381,26 @@ tier0:
       confidence: 99
       method: tier0.exact_name_office_court
 
+    # Fix (g): typo duplicates. Same court + same last name + first name 1-2
+    # letters off (a swap of two letters counts as one) = same judge:
+    # "rondald g morgan" -> "ronald g morgan", "igancio torteya" -> "ignacio
+    # torteya". Trailing junk words and dates are ignored ("ronald g morgan
+    # bond"). Guards: shorter first name >= min_first_len letters, same first
+    # letter, middle names agree when both have them, all fitting names are
+    # forms of one judge,
+    # different FJC ids never join. Also adds a block key on the cleaned surname.
+    - id: judge_name_typo
+      description: "Same court + same last name + first name 1-2 letters off (trailing junk ignored)"
+      type: judge_name_typo
+      enabled: true
+      max_first_edits: 2
+      min_first_len: 5
+      same_first_letter: true
+      trailing_months: true
+      trailing_junk_words: [bond]
+      confidence: 95
+      method: tier0.judge_name_typo
+
   # FJC temporal fields are STRONG EVIDENCE, not hard kill-rules
   # (senior / designation sitting can appear after nominal retirement)
   fjc_date_policy:
