@@ -4,6 +4,7 @@ name_validity.confirmation; turned on by bulk mode).
 A judge name read only from docket text becomes a judge when:
   - it is in the FJC list, or
   - the same name is in a case header / party-record judge field in this file, or
+  - it is read directly after a judge title ("Judge X", "Magistrate Judge X"), or
   - it was already confirmed earlier in the run, or
   - it now appears in a second, different case (promotion).
 Otherwise its mentions are held as "unconfirmed" (pending) and are not
@@ -25,6 +26,7 @@ class JudgeConfirmation:
         spec = (cfg.get("name_validity") or {}).get("confirmation") or {}
         self.enabled = bool(spec.get("enabled"))
         self.confirm_sources = set(spec.get("confirm_sources") or ["case_header", "case_parties"])
+        self.confirm_prefixes = set(spec.get("confirm_prefix_categories") or [])
         self.min_cases = int(spec.get("min_cases", 2))
         n = cfg.get("normalization") or {}
         ext = next(
@@ -50,6 +52,14 @@ class JudgeConfirmation:
     def _sync(self) -> None:
         self.state["judge_confirm"] = {"confirmed": sorted(self.confirmed), "pending": self.pending}
 
+    def _evidence(self, name: str, ms: list[dict]) -> bool:
+        return (
+            name in self.confirmed
+            or name in self.fjc_full
+            or any(m.get("docket_source") in self.confirm_sources for m in ms)
+            or any(m.get("prefix_category") in self.confirm_prefixes for m in ms)
+        )
+
     def filter_file(self, mentions: list[dict]) -> list[dict]:
         """Return the judge mentions to resolve now (incl. released pending ones)."""
         if not self.enabled:
@@ -59,25 +69,12 @@ class JudgeConfirmation:
             by_name.setdefault((m.get("normalized_name") or "").strip(), []).append(m)
         keep: list[dict] = []
         # Names confirmed by this file's own evidence (used for same-case cut-offs).
-        file_ok = {
-            name
-            for name, ms in by_name.items()
-            if name
-            and (
-                name in self.confirmed
-                or name in self.fjc_full
-                or any(m.get("docket_source") in self.confirm_sources for m in ms)
-            )
-        }
+        file_ok = {name for name, ms in by_name.items() if name and self._evidence(name, ms)}
         for name, ms in by_name.items():
             if not name:
                 keep.extend(ms)
                 continue
-            ok = (
-                name in self.confirmed
-                or name in self.fjc_full
-                or any(m.get("docket_source") in self.confirm_sources for m in ms)
-            )
+            ok = name in file_ok
             if not ok and self.fit_spec.get("enabled"):
                 # A cut-off of a judge confirmed in this same case is that judge.
                 short = name.split()
@@ -116,7 +113,7 @@ class JudgeConfirmation:
                         "source_file": m.get("source_file"),
                         "docket_index": m.get("docket_index"),
                         "status": "UNCONFIRMED_JUDGE_NAME",
-                        "reason": "docket text only; not in FJC, not in a case header/party record, seen in one case",
+                        "reason": "docket text only; not in FJC, not in a case header/party record, no judge title right before it, seen in one case",
                     }
                 )
         return rows

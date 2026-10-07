@@ -240,9 +240,15 @@ name_validity:
   # judge field, already confirmed in the run, or seen in min_cases cases;
   # otherwise it is held as unconfirmed (unconfirmed_judges.jsonl) and promoted
   # when it appears in a second case.
+  # confirm_prefix_categories: a name read directly after a judge title
+  # ("Judge X", "Magistrate Judge X", "District Judge X"; engine/docket_ner.py
+  # regex_judge_title) is confirmed. Positions that name a non-judge ("Judge by
+  # X", "from X", "as to X", "filed by X", attorneys, staff) are dropped earlier
+  # by court_personnel, so they never reach this check.
   confirmation:
     enabled: false
     confirm_sources: [case_header, case_parties]
+    confirm_prefix_categories: [regex_judge_title]
     min_cases: 2
   min_name_tokens: 2
   reject_single_char_second_token: true
