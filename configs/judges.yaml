@@ -122,6 +122,28 @@ extraction:
           # PACER docketing-clerk / filer "(Last, First)" near "(Entered: …)"
           regex: "\\(([A-Z][A-Za-z'\\-]+),\\s*([A-Z][A-Za-z'\\-]+)\\)(?=[^\\n]{0,80}\\(Entered:)"
           last_first: true
+        # Fix (e): positions where the docket names a NON-judge (no name lists).
+        # The name group never starts with Judge / Magistrate / Hon. / Honorable /
+        # Chief / Senior / District, so "Signed by Judge X" is never dropped.
+        - name: judge_by
+          regex: '(?i:judge)\s+by\s+(?:(?i:plaintiffs?|defendants?)\s+)?((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+        - name: letter_from
+          regex: '(?i:addressed\s+to\s+(?:the\s+)?(?:hon(?:orable)?\.?\s+)?(?:(?:magistrate|district|chief|senior)\s+)?judge\s+[A-Za-z.'' \-]{2,40}?\s+from)\s+((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+        - name: letter_to_judge_from
+          regex: '(?i:letter\s+to\s+judge\s+[A-Za-z''\-]+;?\s+from)\s+((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+        - name: appointed_counsel
+          regex: '((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})(?:''s)?\s+(?i:is\s+appointed\s+as\s+counsel|motion\s+to\s+withdraw\s+as\s+(?:counsel|attorney))'
+        - name: attorney_title
+          regex: '\b(?:Attorney|ATTORNEY|AUSA|AFPD|A\.F\.P\.D\.)\s+((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+        - name: staff_label
+          regex: '\b(?:CRD|ERO|Interpreter|INTERPRETER|Transcriber|Courtroom\s+Deputy|Deputy\s+Clerk)\s*:?\s+((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+        - name: as_to
+          regex: '(?i:\bas\s+to)\s+((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+        - name: filed_by
+          regex: '(?i:\bfiled\s+by)\s+(?:(?i:plaintiffs?|defendants?)\s+)?((?!(?:The|Hon|Honorable|Judge|Magistrate|Chief|Senior|District|Plaintiffs?|Defendants?|USA|United)\b)(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z])(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z''\-]*[A-Za-z]|(?:de|del|la|van|von|da|dos)\b)){0,4})'
+      # A docket span is also dropped when it is the last 2+ words of a mined
+      # name (spaCy often loses the first name: "Lux Humberto Mora-Benites").
+      match_token_suffixes: true
 
   office_name_default: null           # mention.office_name ← normalized_name
 

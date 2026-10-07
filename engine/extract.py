@@ -81,8 +81,14 @@ def mine_court_personnel_negatives(
                 if last_first and m.lastindex and m.lastindex >= 2:
                     raws.append(f"{m.group(2)} {m.group(1)}")
                 elif m.lastindex:
-                    raws.append(m.group(1).strip())
-    return _norm_set(raws, honorifics, strip_chars)
+                    raws.append(re.sub(r"'s$", "", m.group(1).strip()))
+    names = _norm_set(raws, honorifics, strip_chars)
+    if cp.get("match_token_suffixes"):
+        for n in list(names):
+            t = n.split()
+            for k in range(1, len(t) - 1):
+                names.add(" ".join(t[k:]))
+    return names
 
 
 def personnel_neg_for_source(
