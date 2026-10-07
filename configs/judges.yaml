@@ -356,6 +356,17 @@ tier0:
 # -----------------------------------------------------------------------------
 # Tier 1 — Blocking (grouping only; no merge decisions)
 # -----------------------------------------------------------------------------
+# Same-case recovery (engine/same_case_recovery.py, no LLM): in one case a
+# cut-off judge name joins the single longer name it fits ("b kim" ->
+# "young b kim", "r barclay" -> "r barclay surrick"). The longer name may add
+# at most one word; different FJC ids never join.
+same_case_name_extension:
+  enabled: true
+  min_tokens: 2
+  max_extra_tokens: 1
+  min_truncated_token_len: 4
+  surname_typo_min_len: 5
+
 tier1:
   enabled: true
   # Extra last-2 surname block keys (Hanovice Palermo / Garcia Marmolejo / Gonzales Ramos).

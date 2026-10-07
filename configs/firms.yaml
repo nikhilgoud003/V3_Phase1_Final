@@ -411,6 +411,17 @@ tier0:
 # alone — otherwise every US Attorney's Office would share one candidate set.
 # Institutional classes also block on office_state (from address), not case court.
 # -----------------------------------------------------------------------------
+# Same-case recovery (engine/same_case_recovery.py, no LLM): in one case, at
+# the same street number + ZIP, an office name that is the leading words of
+# another (after these drops and the strip_corp_suffixes list) is the same firm.
+# Generic names (identity_exclusions.generic_office_names) never join.
+same_case_address_prefix:
+  enabled: true
+  min_prefix_tokens: 2
+  drop_leading: [the]
+  drop_tokens: [and]
+  extra_suffixes: ["p c", "p a", "l l p", "l l c", "p l l p", "pllp"]
+
 tier1:
   enabled: true
   strategies:

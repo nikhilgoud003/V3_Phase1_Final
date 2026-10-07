@@ -3479,6 +3479,34 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
         anchor_stats = res["stats"]
         print(f"UCID anchoring: {anchor_stats}", flush=True)
 
+    # Same-case recovery (no LLM): cut-off judge names / firm name variants at
+    # the same address join the fuller name of the same entity in one case.
+    from .same_case_recovery import same_case_recovery
+
+    recovered = 0
+    for mg in same_case_recovery(mentions, cfg):
+        if uf.find(mg["a"]) == uf.find(mg["b"]) or not uf.union(mg["a"], mg["b"]):
+            continue
+        recovered += 1
+        journal.log(
+            {
+                "decision_id": f"dec_{journal.n:08d}",
+                "mention_id_a": mg["a"],
+                "mention_id_b": mg["b"],
+                "entity_type": cfg.get("entity_type"),
+                "decision": "MERGE_TIER0",
+                "confidence": 95,
+                "method": f"tier0.{mg['rule']}",
+                "rationale": f"Same case {mg['ucid']}: {mg['name_b']!r} fits {mg['name_a']!r} ({mg['how']})",
+                "signals": [mg["rule"], mg["how"]],
+                "evidence": {k: mg[k] for k in ("ucid", "name_a", "name_b", "how")},
+                "timestamp": _now(),
+                "config_version": cfg.get("version"),
+            }
+        )
+    if recovered:
+        t0_stats["same_case_recovery"] = recovered
+
     # Tier 1
     _t = time.perf_counter()
     mention_blocks = build_profile_blocks(mentions, cfg)
