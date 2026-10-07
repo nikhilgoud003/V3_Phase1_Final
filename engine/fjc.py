@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import csv
 import json
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .normalize import normalize_name, tokens
+from .normalize import GENERATIONAL_SUFFIXES, normalize_name, tokens
 from .run_cache import file_memo
 
 
@@ -196,8 +197,18 @@ def load_fjc_index(
         if len(nids) == 1:
             alias_to_nids[nn] = sorted(nids)
 
+    # Fix (h): (folded last-name token, court) -> nids, for first-name-prefix linking.
+    surname_court_to_nids: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for nid, j in by_nid.items():
+        j["_last"] = fold_name(_norm(j["last"])).split()
+        j["_given"] = fold_name(_norm(" ".join(p for p in (j["first"], j["middle"]) if p))).split()
+        if j["_last"]:
+            for court in j["courts"]:
+                surname_court_to_nids[(j["_last"][-1], court)].append(nid)
+
     return {
         "by_nid": by_nid,
+        "surname_court_to_nids": dict(surname_court_to_nids),
         "name_court_to_nids": {k: sorted(v) for k, v in name_court_to_nids.items()},
         "name_to_nids": {k: sorted(v) for k, v in name_to_nids.items()},
         "alias_court_to_nids": alias_court_to_nids,
@@ -206,7 +217,38 @@ def load_fjc_index(
     }
 
 
-def link_mentions_to_fjc(mentions: list[dict], fjc_index: dict[str, Any]) -> dict[str, int]:
+def fold_name(s: str) -> str:
+    """Lower-case, strip accents (n with tilde -> n), hyphens to spaces."""
+    t = unicodedata.normalize("NFKD", s or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return " ".join(t.lower().replace("-", " ").split())
+
+
+def fjc_first_prefix_nids(norm: str, court: str, fjc_index: dict[str, Any], spec: dict) -> list[str]:
+    """Fix (h): FJC judges in this court with the same last name whose first or
+    middle name equals or starts with the docket first name ("rolando olvera"
+    -> Jose Rolando Olvera, "sim lake" -> Simeon Timothy Lake). Docket middle
+    names must also fit a given name (equal / initial / start)."""
+    toks = fold_name(norm).split()
+    while toks and toks[-1].rstrip(".") in GENERATIONAL_SUFFIXES:
+        toks.pop()
+    if len(toks) < 2 or len(toks[0]) < int(spec.get("min_first_len", 3)):
+        return []
+    fits = []
+    for nid in (fjc_index.get("surname_court_to_nids") or {}).get((toks[-1], court)) or []:
+        j = fjc_index["by_nid"][nid]
+        last, given = j.get("_last") or [], j.get("_given") or []
+        if not last or len(toks) <= len(last) or toks[-len(last) :] != last:
+            continue
+        rest = toks[: len(toks) - len(last)]
+        if all(any(g.startswith(t) for g in given) for t in rest):
+            fits.append(nid)
+    return fits
+
+
+def link_mentions_to_fjc(
+    mentions: list[dict], fjc_index: dict[str, Any], first_prefix: dict | None = None
+) -> dict[str, int]:
     """
     Attach fjc_nid to mentions when uniquely matched.
     Prefer (name, court) unique match; else unique global name match.
@@ -224,8 +266,10 @@ def link_mentions_to_fjc(mentions: list[dict], fjc_index: dict[str, Any]) -> dic
         "linked_global_unique_alias": 0,
         "ambiguous_court": 0,
         "ambiguous_global": 0,
+        "linked_court_first_name_prefix": 0,
         "unlinked": 0,
     }
+    fp_on = bool((first_prefix or {}).get("enabled"))
 
     for m in mentions:
         norm = m.get("normalized_name") or ""
@@ -269,6 +313,14 @@ def link_mentions_to_fjc(mentions: list[dict], fjc_index: dict[str, Any]) -> dic
             m["fjc_nid"] = None
             m["fjc_nid_candidates"] = nids_a
             continue
+
+        if fp_on:
+            fits = fjc_first_prefix_nids(norm, court, fjc_index, first_prefix or {})
+            if len(fits) == 1:
+                m["fjc_nid"] = fits[0]
+                m["fjc_match_method"] = "fjc_first_name_prefix"
+                stats["linked_court_first_name_prefix"] += 1
+                continue
 
         m["fjc_nid"] = None
         stats["unlinked"] += 1

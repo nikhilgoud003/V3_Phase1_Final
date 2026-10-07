@@ -2,7 +2,7 @@
 name_validity.confirmation; turned on by bulk mode).
 
 A judge name read only from docket text becomes a judge when:
-  - it is in the FJC list, or
+  - it is in the FJC list (incl. the fix (h) first-name-prefix link), or
   - the same name is in a case header / party-record judge field in this file, or
   - it is read directly after a judge title ("Judge X", "Magistrate Judge X"), or
   - it was already confirmed earlier in the run, or
@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from engine.config_loader import resolve_path
-from engine.fjc import load_fjc_index
+from engine.fjc import fjc_first_prefix_nids, load_fjc_index
 from engine.same_case_recovery import judge_name_fits
 
 
@@ -29,11 +29,10 @@ class JudgeConfirmation:
         self.confirm_prefixes = set(spec.get("confirm_prefix_categories") or [])
         self.min_cases = int(spec.get("min_cases", 2))
         n = cfg.get("normalization") or {}
-        ext = next(
-            (r.get("external") or {} for r in (cfg.get("tier0") or {}).get("rules") or [] if r.get("id") == "fjc_nid_join"),
-            {},
-        )
-        idx = load_fjc_index(
+        rule = next((r for r in (cfg.get("tier0") or {}).get("rules") or [] if r.get("id") == "fjc_nid_join"), {})
+        ext = rule.get("external") or {}
+        self.first_prefix = rule.get("first_name_prefix_link") or {}
+        self.fjc_idx = idx = load_fjc_index(
             resolve_path(cfg, ext.get("path", "data/judges_fjc.csv")),
             resolve_path(cfg, ext.get("crosswalk_path", "data/external/fjc_court_crosswalk.json")),
             n.get("strip_honorifics") or [],
@@ -58,6 +57,10 @@ class JudgeConfirmation:
             or name in self.fjc_full
             or any(m.get("docket_source") in self.confirm_sources for m in ms)
             or any(m.get("prefix_category") in self.confirm_prefixes for m in ms)
+            or (
+                self.first_prefix.get("enabled")
+                and len(fjc_first_prefix_nids(name, ms[0].get("court") or "", self.fjc_idx, self.first_prefix)) == 1
+            )
         )
 
     def filter_file(self, mentions: list[dict]) -> list[dict]:

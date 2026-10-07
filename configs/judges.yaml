@@ -317,6 +317,15 @@ tier0:
       match:
         require:
           - mention_linked_nid_equal
+      # Fix (h): when no exact / alias FJC form matches, link a docket name to
+      # the FJC judge of the same court with the same last name (accents and
+      # hyphens ignored) whose first or middle name equals or starts with the
+      # docket first name ("rolando olvera" -> Jose Rolando Olvera, "sim lake"
+      # -> Simeon Timothy Lake). Docket middle names must fit a given name too.
+      # Links only if exactly one FJC judge fits.
+      first_name_prefix_link:
+        enabled: true
+        min_first_len: 3
       confidence: 100
       method: tier0.fjc_nid_join
 

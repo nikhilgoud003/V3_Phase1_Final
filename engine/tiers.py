@@ -3438,7 +3438,7 @@ def run_cascade(mentions: list[dict], cfg: dict, enable_tier3: bool = True) -> d
             honorifics = (cfg.get("normalization") or {}).get("strip_honorifics") or []
             strip_chars = (cfg.get("normalization") or {}).get("strip_chars") or ""
             fjc_index = load_fjc_index(fjc_path, crosswalk, honorifics, strip_chars)
-            fjc_link_stats = link_mentions_to_fjc(mentions, fjc_index)
+            fjc_link_stats = link_mentions_to_fjc(mentions, fjc_index, fjc_rule.get("first_name_prefix_link"))
             fjc_link_stats["n_fjc_judges"] = fjc_index["n_judges"]
             print(f"FJC linked: {fjc_link_stats}")
         else:
