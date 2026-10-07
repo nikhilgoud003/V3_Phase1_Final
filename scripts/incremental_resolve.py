@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 
 from engine.cluster import cluster_mentions
-from engine.embeddings import cached_vectors, compact_embed_text, embed_texts_ollama, seed_vector_cache
+from engine.embeddings import compact_embed_text, embed_texts_ollama, seed_vector_cache
 from engine.poc_party_evidence import adjudicate_poc_evidence_via_tier3, rebuild_components
 from engine.config_loader import load_config_cached, ollama_endpoint, resolve_path
 from engine.provenance import DecisionJournal
@@ -36,7 +36,6 @@ from engine.tiers import (
     load_common_surnames,
     party_slot,
     run_cascade,
-    save_llm_memo,
     tier0_merge_groups,
     tier3_adjudicate,
 )
@@ -96,30 +95,53 @@ def _common_surnames_uncached(cfg: dict) -> set[str]:
 class EmbedCache:
     """Disk copy of the process-wide vector cache (engine.embeddings).
 
-    Loaded once at start and saved once at the end, so a later run that adds
-    files does not re-embed names it has already seen.
+    Loaded once at start. Each checkpoint writes only the vectors added since
+    the last one, as a new shard (embed_cache.NNNNN.npz); checkpoint/state.json
+    records how many shards are committed. A legacy embed_cache.npz is loaded too.
     """
 
     def __init__(self, path: Path, model: str = "nomic-embed-text") -> None:
         self.path = path.with_suffix(".npz")
         self.model = model
+        self.saved: set[str] = set()
         legacy = path.with_suffix(".json")
         if self.path.is_file():
             with np.load(self.path, allow_pickle=False) as z:
-                seed_vector_cache(model, dict(zip(z["texts"].tolist(), z["vectors"])))
+                texts = z["texts"].tolist()
+                seed_vector_cache(model, dict(zip(texts, z["vectors"])))
+                self.saved.update(texts)
         elif legacy.is_file() and legacy.stat().st_size:
             payload = json.loads(legacy.read_text(encoding="utf-8"))
             seed_vector_cache(model, {k: np.asarray(v, dtype=np.float32) for k, v in payload.items()})
+        self.shards = 0
+        st = self.path.parent / "state.json"
+        if st.is_file():
+            self.shards = int(json.loads(st.read_text(encoding="utf-8")).get("embed_shards") or 0)
+        for k in range(self.shards):
+            with np.load(self._shard(k), allow_pickle=False) as z:
+                texts = z["texts"].tolist()
+                seed_vector_cache(model, dict(zip(texts, z["vectors"])))
+                self.saved.update(texts)
+        for extra in self.path.parent.glob(self.path.stem + ".[0-9]*.npz"):
+            if int(extra.name.split(".")[1]) >= self.shards:
+                extra.unlink()  # written after the last committed checkpoint
 
-    def save(self) -> None:
-        vecs = cached_vectors(self.model)
-        if not vecs:
-            return
+    def _shard(self, k: int) -> Path:
+        return self.path.with_name(f"{self.path.stem}.{k:05d}.npz")
+
+    def save(self) -> int:
+        """Write vectors added since the last save; return the shard count to commit."""
+        new = [(t, v) for (m, t), v in list(_VEC_CACHE_ITEMS()) if m == self.model and t not in self.saved]
+        if not new:
+            return self.shards
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        texts = list(vecs)
-        tmp = self.path.with_name(self.path.stem + ".tmp.npz")
-        np.savez(tmp, texts=np.asarray(texts), vectors=np.vstack([vecs[t] for t in texts]))
-        os.replace(tmp, self.path)
+        tmp = self._shard(self.shards).with_name(f"tmp.{self._shard(self.shards).name}")
+        with tmp.open("wb") as f:
+            np.savez(f, texts=np.asarray([t for t, _ in new]), vectors=np.vstack([v for _, v in new]))
+        os.replace(tmp, self._shard(self.shards))
+        self.saved.update(t for t, _ in new)
+        self.shards += 1
+        return self.shards
 
     def vectors_for(self, mentions: list[dict], cfg: dict) -> dict[str, np.ndarray]:
         texts = {m["mention_id"]: compact_embed_text(m) for m in mentions}
@@ -129,6 +151,12 @@ class EmbedCache:
         return {mid: mat[i] for i, mid in enumerate(order)}
 
 
+def _VEC_CACHE_ITEMS():
+    from engine import embeddings
+
+    return embeddings._VEC_CACHE.items()
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -136,15 +164,183 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _rows_text(rows: list[dict]) -> str:
-    return "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+def _write_rows(path: Path, rows) -> None:
+    """Write JSONL row by row (no whole-file string in memory), atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint format 2: append-only streams + one entity generation per save.
+#
+#   state.json            small; written LAST (atomic) = the commit point. Holds
+#                         the committed byte size of every append stream, the
+#                         entity generation and the embed shard count.
+#   processed / timings / case_names / mentions_{type} / decisions /
+#   llm_prompt_cache .jsonl   append-only; bytes past the committed size are
+#                         dropped on load (a save that was cut off).
+#   entities_{type}.gNNNNNN.jsonl, judge_confirm.gNNNNNN.json   rewritten per save.
+#
+# Storage only; what is loaded equals what was in memory:
+#   - co_mentions lists of >= CO_REF_MIN names are stored once per case in
+#     case_names.jsonl ({"_ref": id} in the mention row) when the list is
+#     exactly that case's names minus the mention's own name; else inline.
+#   - entity _proto is stored as {"_ref": mention_id} when it is the saved
+#     mention itself; loaded back as that same mention object.
+#   - decisions are kept on disk only (not in memory) once saved.
+# ---------------------------------------------------------------------------
+CK_FORMAT = 2
+CO_REF_MIN = 50
+_STREAMS = ("processed", "timings", "case_names", "mentions_judge", "mentions_firm", "mentions_party",
+            "decisions", "llm_prompt_cache")
+
+
+def _read_stream(path: Path, nbytes: int | None) -> list[dict]:
+    if not path.is_file():
+        return []
+    if nbytes is not None and path.stat().st_size > nbytes:
+        with path.open("r+b") as f:
+            f.truncate(nbytes)
+    with path.open("rb") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def _append_stream(path: Path, offset: int, rows) -> int:
+    """Append rows at the committed offset (dropping any cut-off tail); return new size."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("r+b" if path.exists() else "wb") as f:
+        f.seek(offset)
+        f.truncate()
+        for r in rows:
+            f.write((json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8"))
+        return f.tell()
+
+
+def checkpoint_rows(out_root: Path, name: str):
+    """Iterate the committed rows of one append stream (used for final decisions.jsonl)."""
+    ck = out_root / "checkpoint"
+    meta = json.loads((ck / "state.json").read_text(encoding="utf-8"))
+    nbytes = (meta.get("bytes") or {}).get(name)
+    path = ck / f"{name}.jsonl"
+    if not path.is_file():
+        return
+    with path.open("rb") as f:
+        read = 0
+        for line in f:
+            read += len(line)
+            if nbytes is not None and read > nbytes:
+                break
+            if line.strip():
+                yield json.loads(line)
+
+
+def _is_case_list(co: list, name: str, universe: set) -> bool:
+    if len(co) != len(universe) - (1 if name in universe else 0) or name in co:
+        return False
+    return all(a < b for a, b in zip(co, co[1:])) and all(x in universe for x in co)
+
+
+def _mention_rows(ms: list[dict], et: str, ck: dict, case_rows: list[dict]):
+    universe: dict[str, set] = {}
+    for m in ms:
+        co = m.get("co_mentions")
+        if isinstance(co, list) and len(co) >= CO_REF_MIN:
+            u = universe.setdefault(m.get("ucid") or "", set())
+            u.update(co)
+            u.add(m.get("normalized_name"))
+    refs: dict[str, int] = {}
+    for m in ms:
+        co = m.get("co_mentions")
+        ucid = m.get("ucid") or ""
+        if isinstance(co, list) and len(co) >= CO_REF_MIN and _is_case_list(co, m.get("normalized_name"), universe[ucid]):
+            if ucid not in refs:
+                ck["case_seq"] = ck.get("case_seq", 0) + 1
+                refs[ucid] = ck["case_seq"]
+                case_rows.append({"id": refs[ucid], "type": et, "ucid": ucid, "names": sorted(universe[ucid])})
+            row = dict(m)
+            row["co_mentions"] = {"_ref": refs[ucid]}
+            yield row
+        else:
+            yield m
+
+
+def _entity_rows(entities: list[dict], by_id: dict[str, dict]):
+    for e in entities:
+        proto = e.get("_proto")
+        mid = proto.get("mention_id") if isinstance(proto, dict) else None
+        if mid and (by_id.get(mid) is proto or by_id.get(mid) == proto):
+            row = dict(e)
+            row["_proto"] = {"_ref": mid}
+            yield row
+        else:
+            yield e
 
 
 def load_checkpoint(out_root: Path) -> dict[str, Any] | None:
     state_path = out_root / "checkpoint" / "state.json"
     if not state_path.is_file():
         return None
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    meta = json.loads(state_path.read_text(encoding="utf-8"))
+    if meta.get("format") != CK_FORMAT:
+        return _load_checkpoint_v1(out_root, meta)
+    ck = out_root / "checkpoint"
+    nbytes = meta.get("bytes") or {}
+    rd = {name: _read_stream(ck / f"{name}.jsonl", nbytes.get(name, 0)) for name in _STREAMS if name != "llm_prompt_cache"}
+    # The LLM cache stream is read by load_llm_memo; drop a cut-off tail here.
+    _read_stream(ck / "llm_prompt_cache.jsonl", nbytes.get("llm_prompt_cache", 0))
+    cases = {r["id"]: r["names"] for r in rd["case_names"]}
+    state: dict[str, Any] = {
+        "processed": rd["processed"],
+        "timings": rd["timings"],
+        "next_serial": meta["next_serial"],
+        "poc_evidence": meta.get("poc_evidence") or [],
+        "cascade_last": meta.get("cascade_last") or {},
+        "decisions": [],
+        "mentions": {},
+        "entities": {},
+    }
+    gen = int(meta.get("gen") or 0)
+    for et in ("judge", "firm", "party"):
+        ms = rd[f"mentions_{et}"]
+        for m in ms:
+            co = m.get("co_mentions")
+            if isinstance(co, dict) and "_ref" in co:
+                own = m.get("normalized_name")
+                m["co_mentions"] = [x for x in cases[co["_ref"]] if x != own]
+        state["mentions"][et] = ms
+        by_id = {m["mention_id"]: m for m in ms}
+        ents = _read_stream(ck / f"entities_{et}.g{gen:06d}.jsonl", None)
+        for e in ents:
+            p = e.get("_proto")
+            if isinstance(p, dict) and "_ref" in p:
+                e["_proto"] = by_id[p["_ref"]]
+        state["entities"][et] = ents
+    jc = ck / f"judge_confirm.g{gen:06d}.json"
+    if jc.is_file():
+        state["judge_confirm"] = json.loads(jc.read_text(encoding="utf-8"))
+    for old in list(ck.glob("entities_*.g*.jsonl")) + list(ck.glob("judge_confirm.g*.json")):
+        if f".g{gen:06d}." not in old.name:
+            old.unlink()
+    state["_ck"] = {
+        "bytes": dict(nbytes),
+        "rows": {
+            "processed": len(state["processed"]),
+            "timings": len(state["timings"]),
+            **{f"mentions_{et}": len(state["mentions"][et]) for et in ("judge", "firm", "party")},
+            "llm_prompt_cache": int((meta.get("rows") or {}).get("llm_prompt_cache") or 0),
+        },
+        "gen": gen,
+        "case_seq": int(meta.get("case_seq") or 0),
+    }
+    return state
+
+
+def _load_checkpoint_v1(out_root: Path, state: dict) -> dict[str, Any]:
+    """Format-1 checkpoint (every file rewritten per save). The next save writes format 2."""
     ck = out_root / "checkpoint"
 
     def _load(name: str) -> list[dict]:
@@ -171,43 +367,58 @@ def load_checkpoint(out_root: Path) -> dict[str, Any] | None:
 
 
 def save_checkpoint(out_root: Path, state: dict[str, Any]) -> None:
+    """Append what is new since the last save, rewrite entities, then commit state.json."""
+    from engine.tiers import _LLM_MEMO
+
     ck = out_root / "checkpoint"
     ck.mkdir(parents=True, exist_ok=True)
+    c = state.setdefault("_ck", {"bytes": {}, "rows": {}, "gen": 0, "case_seq": 0})
+    first = not c["bytes"]  # fresh run or a format-1 checkpoint: write every stream from 0
+    nb, nr = c["bytes"], c["rows"]
+
+    def put(name: str, rows) -> None:
+        nb[name] = _append_stream(ck / f"{name}.jsonl", 0 if first else nb.get(name, 0), rows)
+
+    put("processed", state["processed"][nr.get("processed", 0):])
+    put("timings", state["timings"][nr.get("timings", 0):])
+    nr["processed"], nr["timings"] = len(state["processed"]), len(state["timings"])
+    case_rows: list[dict] = []
+    for et in ("judge", "firm", "party"):
+        key = f"mentions_{et}"
+        put(key, _mention_rows(state["mentions"][et][nr.get(key, 0):], et, c, case_rows))
+        nr[key] = len(state["mentions"][et])
+    put("case_names", case_rows)
+    put("decisions", state["decisions"])
+    state["decisions"].clear()  # on disk now; the final decisions.jsonl streams from there
+    memo = list(_LLM_MEMO.items())
+    put("llm_prompt_cache", ({"key": k, "response": v} for k, v in memo[nr.get("llm_prompt_cache", 0):]))
+    nr["llm_prompt_cache"] = len(memo)
+
+    gen = int(c.get("gen") or 0) + 1
+    for et in ("judge", "firm", "party"):
+        by_id = {m["mention_id"]: m for m in state["mentions"][et]}
+        _write_rows(ck / f"entities_{et}.g{gen:06d}.jsonl", _entity_rows(state["entities"][et], by_id))
+    if state.get("judge_confirm"):
+        _atomic_write(ck / f"judge_confirm.g{gen:06d}.json", json.dumps(state["judge_confirm"], ensure_ascii=False))
+    shards = state["embed_cache"].save() if state.get("embed_cache") is not None else 0
+
     meta = {
-        "processed": state["processed"],
+        "format": CK_FORMAT,
+        "processed_count": len(state["processed"]),
         "next_serial": state["next_serial"],
-        "timings": state["timings"],
         "poc_evidence": state.get("poc_evidence") or [],
         "cascade_last": state.get("cascade_last") or {},
+        "gen": gen,
+        "embed_shards": shards,
+        "case_seq": c.get("case_seq", 0),
+        "bytes": nb,
+        "rows": {"llm_prompt_cache": nr["llm_prompt_cache"]},
     }
-    _atomic_write(ck / "state.json", json.dumps(meta, indent=2, default=str))
-    for et in ("judge", "firm", "party"):
-        _atomic_write(ck / f"entities_{et}.jsonl", _rows_text(state["entities"][et]))
-        _atomic_write(ck / f"mentions_{et}.jsonl", _rows_text(state["mentions"][et]))
-    _atomic_write(ck / "decisions.jsonl", _rows_text(state["decisions"]))
-    if state.get("judge_confirm"):
-        _atomic_write(ck / "judge_confirm.json", json.dumps(state["judge_confirm"], ensure_ascii=False))
-    if state.get("embed_cache") is not None:
-        state["embed_cache"].save()
-    save_llm_memo(ck / "llm_prompt_cache.jsonl")
-    public_entities = []
-    public_mentions = []
-    for et in ("judge", "firm", "party"):
-        for e in state["entities"][et]:
-            row = {k: v for k, v in e.items() if k != "_proto"}
-            row["type"] = et
-            row["entity_type"] = et
-            public_entities.append(row)
-        for m in state["mentions"][et]:
-            row = dict(m)
-            row["type"] = et
-            row.setdefault("entity_type", et)
-            public_mentions.append(row)
-    _atomic_write(out_root / "entities.jsonl", _rows_text(public_entities))
-    _atomic_write(out_root / "mentions.jsonl", _rows_text(public_mentions))
-    _atomic_write(out_root / "decisions.jsonl", _rows_text(state["decisions"]))
-    summary = state.get("summary_partial") or {"checkpoint": True, "processed": state["processed"]}
-    _atomic_write(out_root / "summary.json", json.dumps(summary, indent=2, default=str))
+    _atomic_write(ck / "state.json", json.dumps(meta, indent=2, default=str))  # commit point
+    c["gen"] = gen
+    for old in list(ck.glob("entities_*.jsonl")) + list(ck.glob("judge_confirm*.json")):
+        if f".g{gen:06d}." not in old.name and old.name.startswith(("entities_", "judge_confirm")):
+            old.unlink()
 
 
 def _proto(entity: dict, by_id: dict[str, dict]) -> dict:

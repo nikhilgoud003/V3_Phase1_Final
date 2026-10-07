@@ -425,7 +425,7 @@ def attach_party_case_context(
         m["poc_is_mdl"] = is_mdl
 
 
-def write_jsonl(path: Path, rows: list[dict]) -> None:
+def write_jsonl(path: Path, rows) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for r in rows:
@@ -631,29 +631,23 @@ def write_final_bundle(
     *,
     entities_by_type: dict[str, list[dict]],
     mentions_by_type: dict[str, list[dict]],
-    decisions: list[dict],
+    decisions,
     summary: dict,
 ) -> None:
     """Write the single final output set (no per-file step folders)."""
     out_root.mkdir(parents=True, exist_ok=True)
 
-    ent_rows: list[dict] = []
-    for etype in ("judge", "firm", "party"):
-        for e in entities_by_type.get(etype) or []:
-            row = dict(e)
-            row["type"] = etype
-            row.setdefault("entity_type", etype)
-            ent_rows.append(row)
-    write_jsonl(out_root / "entities.jsonl", ent_rows)
+    def typed(by_type: dict[str, list[dict]]):
+        # Row by row: no second in-memory copy of every entity / mention.
+        for etype in ("judge", "firm", "party"):
+            for x in by_type.get(etype) or []:
+                row = dict(x)
+                row["type"] = etype
+                row.setdefault("entity_type", etype)
+                yield row
 
-    men_rows: list[dict] = []
-    for etype in ("judge", "firm", "party"):
-        for m in mentions_by_type.get(etype) or []:
-            row = dict(m)
-            row["type"] = etype
-            row.setdefault("entity_type", etype)
-            men_rows.append(row)
-    write_jsonl(out_root / "mentions.jsonl", men_rows)
+    write_jsonl(out_root / "entities.jsonl", typed(entities_by_type))
+    write_jsonl(out_root / "mentions.jsonl", typed(mentions_by_type))
 
     write_jsonl(out_root / "decisions.jsonl", decisions)
     (out_root / "summary.json").write_text(
@@ -1024,10 +1018,13 @@ def main() -> int:
             if args.checkpoint_every and len(state["processed"]) % args.checkpoint_every == 0:
                 inc.save_checkpoint(out_root, state)
             timing["sec_write"] = round(time.perf_counter() - t_write, 3)
+            # sec = work on the file; write = checkpoint save (every N files);
+            # wall = real clock for this file including the save.
             print(
                 f"FILE_SEC step={step_i} file={fp.name} sec={timing['sec_total']:.3f} "
                 f"read={timing['sec_read']:.3f} extract={timing['sec_extract']:.3f} "
-                f"resolve={timing['sec_resolve']:.3f}",
+                f"resolve={timing['sec_resolve']:.3f} write={timing['sec_write']:.3f} "
+                f"wall={time.perf_counter() - t_file:.3f}",
                 flush=True,
             )
             print(f"CHECKPOINT file_done={step_i} name={fp.name}", flush=True)
@@ -1056,7 +1053,6 @@ def main() -> int:
             "mode": "match_new_file_against_saved_registry",
         }
 
-        decisions = list(state['decisions'])
         cross_final = {
             etype: entity_cross_file_report(final_entities[etype], {m["mention_id"]: m for m in final_mentions[etype]})
             for etype in ("judge", "firm", "party")
@@ -1111,11 +1107,12 @@ def main() -> int:
             },
         }
         final_entities = {
-            et: [{k: v for k, v in e.items() if k != "_proto"} for e in state["entities"][et]]
+            et: ({k: v for k, v in e.items() if k != "_proto"} for e in state["entities"][et])
             for et in ("judge", "firm", "party")
         }
         final_mentions = state["mentions"]
-        decisions = list(state["decisions"])
+        # Decisions live on disk once checkpointed; stream them from there.
+        decisions = inc.checkpoint_rows(out_root, "decisions")
         if judge_confirm.enabled:
             write_jsonl(out_root / "unconfirmed_judges.jsonl", judge_confirm.unconfirmed_rows())
         if not tier3_on or UNCERTAIN_ROWS:
