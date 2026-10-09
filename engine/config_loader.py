@@ -85,6 +85,15 @@ def apply_runtime_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
             if isinstance(nv.get("confirmation"), dict):
                 nv["confirmation"]["enabled"] = True
 
+    if (os.environ.get("TIER_V3_QWEN") or "").strip().lower() in {"1", "on", "true", "yes"}:
+        # --qwen: the bulk rule set above, plus qwen for hard pairs (Tier3) and the
+        # qwen judge-name check. The rule-based judge confirmation stays on.
+        cfg.setdefault("tier3", {})["enabled"] = True
+        nv = cfg.get("name_validity")
+        # Only where a name check is configured (judges); bulk adds an empty entry elsewhere.
+        if isinstance(nv, dict) and isinstance(nv.get("llm_validation"), dict) and nv["llm_validation"].get("prompt_path"):
+            nv["llm_validation"]["enabled"] = True
+
     tier3_env = (os.environ.get("TIER_V3_TIER3") or "").strip().lower()
     if tier3_env in {"off", "0", "false", "no"}:
         cfg.setdefault("tier3", {})["enabled"] = False
@@ -128,6 +137,7 @@ _ENV_KEYS = (
     "TIER_V3_TIER2_BACKEND",
     "TIER_V3_TIER3",
     "TIER_V3_BULK",
+    "TIER_V3_QWEN",
     "TIER_V3_JSON_DIR",
     "TIER_V3_DATA_DIR",
     "TIER_V3_OUTPUT_DIR",

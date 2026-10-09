@@ -718,6 +718,13 @@ def main() -> int:
         "judge-name confirmation on). Default: configs/unified.yaml bulk.",
     )
     ap.add_argument(
+        "--qwen",
+        action="store_true",
+        default=False,
+        help="Same rules as --bulk (rule-based judge confirmation, judge-title rule, all fixes), "
+        "plus qwen: Tier3 for hard pairs and the qwen judge-name check. Implies --bulk.",
+    )
+    ap.add_argument(
         "--tier3",
         choices=["on", "off"],
         default=None,
@@ -793,13 +800,20 @@ def main() -> int:
     if args.tier3 is not None:
         tier3_on = args.tier3 == "on"
     bulk = bool(unified_pre.get("bulk", False)) if args.bulk is None else True
+    if args.qwen:
+        bulk = True
     if bulk:
-        tier3_on = False
+        tier3_on = bool(args.qwen)
         os.environ["TIER_V3_BULK"] = "1"
     else:
         os.environ.pop("TIER_V3_BULK", None)
+    if args.qwen:
+        os.environ["TIER_V3_QWEN"] = "1"
+    else:
+        os.environ.pop("TIER_V3_QWEN", None)
     os.environ["TIER_V3_TIER3"] = "on" if tier3_on else "off"
-    print(f"Mode: {'BULK (no LLM calls)' if bulk else 'single/standard'}", flush=True)
+    mode = "BULK rules + qwen (Tier3 + qwen judge-name check)" if args.qwen else "BULK (no LLM calls)" if bulk else "single/standard"
+    print(f"Mode: {mode}", flush=True)
     print(f"Tier3 (LLM pair adjudication): {'on' if tier3_on else 'off'}", flush=True)
 
     cfgs: dict[str, dict] = {}
@@ -1081,6 +1095,7 @@ def main() -> int:
             "tier3_enabled": tier3_on,
             "uncertain_pairs": len(UNCERTAIN_ROWS),
             "bulk_mode": bulk,
+            "qwen_mode": bool(args.qwen),
             "judge_confirmation": dict(judge_confirm.stats, enabled=judge_confirm.enabled,
                                        unconfirmed_mentions=sum(len(v) for v in judge_confirm.pending.values()),
                                        unconfirmed_names=len(judge_confirm.pending)),
